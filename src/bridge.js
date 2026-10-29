@@ -2259,16 +2259,25 @@ async function main() {
     if (!['qq', 'whisper', 'both'].includes(engine)) return null;
     const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
     const accessToken = cfg.snowluma?.accessToken ? String(cfg.snowluma.accessToken) : '';
+    // 同一条消息的 textContent / plainContent 会各调一次 segmentsToText，都会碰到同一个
+    // record 段。这里用闭包缓存保证一条语音只转写一次（否则会打两次 ASR 接口、打两条日志）。
+    const memo = new Map();
     return async (segment) => {
-      try {
-        const result = await transcribeVoice({ httpUrl, accessToken, messageId, segment, asr });
-        if (result?.text) log(`[asr] ${messageId ?? '?'} 语音识别（${result.via}）：${result.text.slice(0, 60)}`);
-        else log(`[asr] ${messageId ?? '?'} 语音没转出文字（${engine}）`);
-        return result?.text ?? '';
-      } catch (error) {
-        log(`[asr] 语音识别失败（不影响本条消息）：${error?.message ?? error}`);
-        return '';
-      }
+      const segKey = String(segment?.data?.file ?? segment?.data?.url ?? segment?.data?.path ?? segment?.data?.file_id ?? '');
+      if (memo.has(segKey)) return memo.get(segKey);
+      const promise = (async () => {
+        try {
+          const result = await transcribeVoice({ httpUrl, accessToken, messageId, segment, asr });
+          if (result?.text) log(`[asr] ${messageId ?? '?'} 语音识别（${result.via}）：${result.text.slice(0, 60)}`);
+          else log(`[asr] ${messageId ?? '?'} 语音没转出文字（${engine}）`);
+          return result?.text ?? '';
+        } catch (error) {
+          log(`[asr] 语音识别失败（不影响本条消息）：${error?.message ?? error}`);
+          return '';
+        }
+      })();
+      memo.set(segKey, promise);
+      return promise;
     };
   }
 
