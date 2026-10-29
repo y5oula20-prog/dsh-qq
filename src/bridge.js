@@ -30,6 +30,7 @@ import { enrichScene } from './art-tags.js';
 import { transcribeVoice, defaultAsrConfig } from './asr.js';
 import { singWithAceStep, normalizeLyrics, aceStepHealth, defaultSongConfig } from './song.js';
 import { convertVoice, rvcHealth, defaultRvcConfig } from './rvc.js';
+import { gsvSpeak, gsvHealth, defaultGsvConfig } from './gsv.js';
 import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } from './snowluma-conn.js';
 import { hardenDir, manualDirCommand } from './state-acl.mjs';
 import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardResponse } from './forward.js';
@@ -1823,6 +1824,12 @@ async function main() {
     return defaultRvcConfig(r);
   }
 
+  // 音色克隆说话的配置（GPT-SoVITS：用 3–10 秒参考人声克隆声线来念字）。
+  function gsvCfg() {
+    const g = cfg.socialV2?.gsv ?? {};
+    return defaultGsvConfig(g);
+  }
+
   // ── 服务自愈：探服务 → 不在就 spawn start-*.sh --bg 并等就绪 ─────────────
   // 不是开机自启（用户 m01498 明确不要）：服务平时不占内存，只有小柚真要
   // 唱/说/换声的那一刻才临时拉起。拉不起来按各自通道既有兜底走：
@@ -1891,6 +1898,16 @@ async function main() {
       probe: () => rvcServerProbe(rc),
       readyMs: 30000,
       settleMs: 2000
+    });
+  }
+
+  async function ensureGsv(gc) {
+    return ensureService({
+      name: 'gsv',
+      script: path.join(ROOT, 'scripts', 'start-gsv.sh'),
+      probe: () => gsvHealth({ apiUrl: gc.apiUrl }),
+      readyMs: 120000,
+      settleMs: 3000
     });
   }
 
@@ -2331,62 +2348,108 @@ async function main() {
    * 会走和 send_voice 完全相同的安全与限流通道（voiceBudgetCheck / sendVoiceV2），
    * 因为合成出来的文件本来就在库里，不需要为它开任何新的路径例外。
    */
-  async function sayForV2(key, { text, voice, rate, pitch, volume, label = '', verify = null } = {}) {
+  async function sayForV2(key, { text, voice, rate, pitch, volume, label = '', verify = null, convert = null } = {}) {
     const vc = voiceCfg();
     const tc = ttsCfg();
-    if (!tc.enabled) throw new Error('语音合成已关闭（socialV2.tts.enabled=false）');
     if (!vc.enabled) throw new Error('语音功能已关闭（socialV2.voice.enabled=false）');
     const clean = sanitizeSpeechText(text, tc.maxChars);
     // 限流要在合成之前判：合成本身要花时间与网络，不能先烧掉再被拒。
     voiceBudgetCheck(key, vc);
-    const synth = await synthesizeSpeech({
-      text: clean,
-      outDir: vc.dir,
-      voice: voice || tc.voice,
-      rate: rate ?? tc.rate,
-      pitch: pitch ?? tc.pitch,
-      volume: volume ?? tc.volume,
-      engine: tc.engine,
-      bin: tc.bin,
-      maxChars: tc.maxChars
-    });
 
-    // 换音色：让说话和唱歌是同一个人。
-    // TTS 出来的是干净单声道，没有伴奏，不需要分离（separate:false 省 6 秒）。
-    // 换声失败就用 TTS 原声，不因为音色没统一就整句发不出去。
-    let speechPath = synth.path;
+    // 合成中间文件路径、最终要发的路径、中间文件是否复用了缓存。
+    let synthPath = null;
+    let speechPath = null;
+    let bytes = 0;
+    let engine = tc.engine;
+    let ttsVoice = voice || tc.voice;
     let converted = false;
-    const rc = rvcCfg();
-    if (rc.enabled && rc.speech) {
+    let reused = false;
+
+    // ① 音色克隆优先：GPT-SoVITS 用 3–10 秒参考人声克隆声线，比 edge-tts + RVC 大肥鱼
+    //    更"像小柚本人"。出来就是目标音色，不用再 RVC 换声。失败回退老链，不阻塞。
+    //    convert=false 时跳过（连同 RVC 一起跳过），用于 A/B 试听纯 edge-tts 原声。
+    const gc = gsvCfg();
+    if (gc.enabled && gc.speech && gc.refAudioPath && convert !== false) {
       try {
-        // 自愈：RVC 常驻服务没起就先拉起，让说话也走快通道（2.4s 而不是 CLI 6.9s）。
-        await ensureRvc(rc);
-        const r = await convertVoice({
-          inPath: synth.path,
+        await ensureGsv(gc);
+        const g = await gsvSpeak({
+          apiUrl: gc.apiUrl,
+          text: clean,
+          refAudioPath: gc.refAudioPath,
+          promptText: gc.promptText,
+          promptLang: gc.promptLang,
+          textLang: gc.textLang,
+          mediaType: gc.mediaType,
           outDir: vc.dir,
-          cfg: { ...rc, separate: false, keepSource: tc.keepFiles === true }
+          timeoutMs: gc.timeoutMs
         });
-        speechPath = r.path;
-        converted = true;
+        synthPath = g.path;
+        speechPath = g.path;
+        bytes = g.bytes;
+        reused = g.reused;
+        engine = 'gsv';
+        ttsVoice = gc.refAudioPath;
       } catch (error) {
-        log(`[tts] ${key} 换音色失败，发原声：${error?.message ?? error}`);
+        log(`[gsv] ${key} 音色克隆说话失败，回退 edge-tts+RVC：${error?.message ?? error}`);
       }
     }
+
+    // ② 老链：edge-tts 合成 → RVC 换大肥鱼音色。
+    if (!speechPath) {
+      if (!tc.enabled) throw new Error('语音合成已关闭（socialV2.tts.enabled=false）');
+      const synth = await synthesizeSpeech({
+        text: clean,
+        outDir: vc.dir,
+        voice: voice || tc.voice,
+        rate: rate ?? tc.rate,
+        pitch: pitch ?? tc.pitch,
+        volume: volume ?? tc.volume,
+        engine: tc.engine,
+        bin: tc.bin,
+        maxChars: tc.maxChars
+      });
+      synthPath = synth.path;
+      speechPath = synth.path;
+      bytes = synth.bytes;
+      reused = synth.reused === true;
+      engine = synth.engine;
+      ttsVoice = synth.voice;
+
+      // 换音色：让说话和唱歌是同一个人。TTS 出来的是干净单声道，没有伴奏，
+      // 不需要分离（separate:false 省 6 秒）。换声失败就用 TTS 原声。
+      // convert=false 跳过，用于 A/B 试听纯 edge-tts 原声。
+      const rc = rvcCfg();
+      if (rc.enabled && rc.speech && convert !== false) {
+        try {
+          await ensureRvc(rc);
+          const r = await convertVoice({
+            inPath: synth.path,
+            outDir: vc.dir,
+            cfg: { ...rc, separate: false, keepSource: tc.keepFiles === true }
+          });
+          speechPath = r.path;
+          converted = true;
+        } catch (error) {
+          log(`[tts] ${key} 换音色失败，发原声：${error?.message ?? error}`);
+        }
+      }
+    }
+
     let sent;
     try {
       // budget:false —— 上面已经检查过额度，sendVoiceForV2 内部不要再查一遍（否则同一句语音扣两次）
       sent = await sendVoiceForV2(key, path.basename(speechPath), { label, verify, audio: null, budget: false });
     } finally {
-      if (!tc.keepFiles && synth.reused !== true) {
-        try { fs.unlinkSync(synth.path); } catch {}
-        if (speechPath !== synth.path) { try { fs.unlinkSync(speechPath); } catch {} }
+      if (!tc.keepFiles && !reused) {
+        if (synthPath) { try { fs.unlinkSync(synthPath); } catch {} }
+        if (speechPath && speechPath !== synthPath) { try { fs.unlinkSync(speechPath); } catch {} }
       }
     }
     voiceBudgetCommit(key);
     recordVoiceSentV2(key, sent, label || clean.slice(0, 40));
-    log(`[tts] ${key} 说了一句（${clean.length} 字 → ${synth.bytes} B，${sent.detail}${converted ? '，已换音色' : ''}）`);
+    log(`[say] ${key} 说了一句（${clean.length} 字 → ${bytes} B，${sent.detail}${engine === 'gsv' ? '，音色克隆' : converted ? '，已换音色' : ''}）`);
     appendActivity(`${key} [tts] 语音合成 ${clean.slice(0, 30)}`);
-    return { ...sent, text: clean, bytes: synth.bytes, ttsVoice: synth.voice, engine: synth.engine, converted };
+    return { ...sent, text: clean, bytes, ttsVoice, engine, converted };
   }
 
   /**
@@ -7456,31 +7519,62 @@ async function main() {
             }
           }
           try {
-            const synth = await synthesizeSpeech({
-              text: String(body.text ?? ''),
-              outDir: vc.dir,
-              voice: body.voice ? String(body.voice).trim() : tc.voice,
-              rate: body.rate ?? tc.rate,
-              pitch: body.pitch ?? tc.pitch,
-              volume: body.volume ?? tc.volume,
-              engine: tc.engine,
-              bin: tc.bin,
-              maxChars: tc.maxChars,
-              force: body.force === true
-            });
-            // 换音色（与 AI 通道 sayForV2 保持一致）：body.convert=false 可跳过，用于 A/B 试听。
-            let sayPath = synth.path;
+            const text = String(body.text ?? '');
+            // 音色克隆优先（与 AI 通道 sayForV2 一致），失败回退 edge-tts + RVC。
+            const gc = gsvCfg();
+            let sayPath = null;
+            let synth = null;
             let sayConverted = false;
-            const sayRvc = rvcCfg();
-            if (sayRvc.enabled && sayRvc.speech && body.convert !== false) {
+            let sayEngine = tc.engine;
+            let sayVoice = tc.voice;
+            if (gc.enabled && gc.speech && gc.refAudioPath && body.convert !== false && body.gsv !== false) {
               try {
-                // 自愈：RVC 常驻服务没起就先拉起，说话走快通道。
-                await ensureRvc(sayRvc);
-                const conv = await convertVoice({ inPath: synth.path, outDir: vc.dir, cfg: { ...sayRvc, separate: false } });
-                sayPath = conv.path;
-                sayConverted = true;
+                await ensureGsv(gc);
+                const g = await gsvSpeak({
+                  apiUrl: gc.apiUrl,
+                  text,
+                  refAudioPath: gc.refAudioPath,
+                  promptText: gc.promptText,
+                  promptLang: gc.promptLang,
+                  textLang: gc.textLang,
+                  mediaType: gc.mediaType,
+                  outDir: vc.dir,
+                  timeoutMs: gc.timeoutMs
+                });
+                synth = { path: g.path, bytes: g.bytes, voice: gc.refAudioPath, engine: 'gsv', text: sanitizeSpeechText(text, tc.maxChars), reused: g.reused };
+                sayPath = g.path;
+                sayEngine = 'gsv';
+                sayVoice = gc.refAudioPath;
               } catch (error) {
-                log(`[tts] (操作者) 换音色失败，发原声：${error?.message ?? error}`);
+                log(`[gsv] (操作者) 音色克隆说话失败，回退 edge-tts+RVC：${error?.message ?? error}`);
+              }
+            }
+            if (!sayPath) {
+              synth = await synthesizeSpeech({
+                text,
+                outDir: vc.dir,
+                voice: body.voice ? String(body.voice).trim() : tc.voice,
+                rate: body.rate ?? tc.rate,
+                pitch: body.pitch ?? tc.pitch,
+                volume: body.volume ?? tc.volume,
+                engine: tc.engine,
+                bin: tc.bin,
+                maxChars: tc.maxChars,
+                force: body.force === true
+              });
+              sayPath = synth.path;
+              // 换音色（与 AI 通道 sayForV2 保持一致）：body.convert=false 可跳过，用于 A/B 试听。
+              const sayRvc = rvcCfg();
+              if (sayRvc.enabled && sayRvc.speech && body.convert !== false) {
+                try {
+                  // 自愈：RVC 常驻服务没起就先拉起，说话走快通道。
+                  await ensureRvc(sayRvc);
+                  const conv = await convertVoice({ inPath: synth.path, outDir: vc.dir, cfg: { ...sayRvc, separate: false } });
+                  sayPath = conv.path;
+                  sayConverted = true;
+                } catch (error) {
+                  log(`[tts] (操作者) 换音色失败，发原声：${error?.message ?? error}`);
+                }
               }
             }
             if (noSend) {
@@ -7492,8 +7586,8 @@ async function main() {
                 converted: sayConverted,
                 sourceFile: sayConverted ? synth.path : undefined,
                 bytes: synth.bytes,
-                voice: synth.voice,
-                engine: synth.engine,
+                voice: sayVoice,
+                engine: sayEngine,
                 text: synth.text,
                 duration: probe.duration ?? null,
                 detail: probe.ok ? describeAudio(probe) : probe.error
@@ -7502,18 +7596,18 @@ async function main() {
             }
             const sent = await sendVoiceV2(key, sayPath, { guard: false, audit: true, audio: null });
             const verification = body.verify === false ? null : await verifyVoiceMessageSent(sent.messageId);
-            if (!tc.keepFiles) {
+            if (!tc.keepFiles && synth.reused !== true) {
               try { fs.unlinkSync(synth.path); } catch {}
               if (sayPath !== synth.path) { try { fs.unlinkSync(sayPath); } catch {} }
             }
-            log(`[tts] (操作者) ${key} 说了一句（${synth.text.length} 字，${synth.bytes} B${sayConverted ? '，已换音色' : ''}）`);
+            log(`[tts] (操作者) ${key} 说了一句（${synth.text.length} 字，${synth.bytes} B${sayEngine === 'gsv' ? '，音色克隆' : sayConverted ? '，已换音色' : ''}）`);
             sendJson({
               ok: true,
               key,
               messageId: sent.messageId,
               text: synth.text,
-              ttsVoice: synth.voice,
-              engine: synth.engine,
+              ttsVoice: sayVoice,
+              engine: sayEngine,
               bytes: synth.bytes,
               detail: sent.detail,
               converted: sayConverted,

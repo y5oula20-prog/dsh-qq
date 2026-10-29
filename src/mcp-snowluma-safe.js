@@ -1304,7 +1304,7 @@ if (cfg.socialV2?.voice?.enabled !== false && cfg.socialV2?.tools?.sendVoice !==
 
   server.tool(
     'qq_say',
-    '用自己的声音说一句话（现合成：文字 → 语音条发出去）。适合「说」而不是「唱」的场合：喊人起床、撒娇、道晚安、把一句重要的话用声音讲出来。voice 可换音色（默认小柚是活泼少女 zh-CN-XiaoyiNeural，想变调可用 pitch 参数如 "+20Hz" 更幼、" -30Hz" 更御）。注意：① 单条上限约 200 字，别把整段聊天记录念出来；② 受频率上限约束（默认每分钟 2 条、每小时 10 条），和 qq_send_voice 共用额度；③ 语音是比文字更强的表达，一天偶尔两三句就够，别每句都发语音；④ verified=true 才是真落地了，否则别对用户说"我给你发了语音"。',
+    '用自己的声音说一句话（现合成：文字 → 语音条发出去）。适合「说」而不是「唱」的场合：喊人起床、撒娇、道晚安、把一句重要的话用声音讲出来。voice 可换音色（默认小柚是活泼少女 zh-CN-XiaoyiNeural，想变调可用 pitch 参数如 "+20Hz" 更幼、" -30Hz" 更御）。注意：① 单条上限约 200 字，别把整段聊天记录念出来；② 受频率上限约束（默认每分钟 2 条、每小时 10 条），和 qq_send_voice 共用额度；③ 语音是比文字更强的表达，一天偶尔两三句就够，别每句都发语音；④ verified=true 才是真落地了，否则别对用户说"我给你发了语音"。⑤ 默认走音色克隆（GPT-SoVITS，参考音频在配置里），克隆服务没起会自动拉起，失败回退 edge-tts；想试听纯 edge-tts 原声可传 convert=false。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -1313,9 +1313,10 @@ if (cfg.socialV2?.voice?.enabled !== false && cfg.socialV2?.tools?.sendVoice !==
       rate: z.string().optional().describe('可选：语速，形如 +10% / -10%'),
       pitch: z.string().optional().describe('可选：音高，形如 +20Hz / -20Hz（正数更尖更幼，负数更低沉）'),
       label: z.string().optional().describe('可选：写进会话记录的说明，如「喊主人起床」'),
-      verify: z.boolean().optional().describe('是否回读校验（默认 true）')
+      verify: z.boolean().optional().describe('是否回读校验（默认 true）'),
+      convert: z.boolean().optional().describe('可选：false 跳过音色克隆和换声，试听纯 edge-tts 原声（默认 true）')
     },
-    async ({ key, token, text, voice, rate, pitch, label, verify }) => {
+    async ({ key, token, text, voice, rate, pitch, label, verify, convert }) => {
       try {
         const data = await agentApi('/api/socialV2/say', {
           method: 'POST',
@@ -1327,7 +1328,8 @@ if (cfg.socialV2?.voice?.enabled !== false && cfg.socialV2?.tools?.sendVoice !==
             rate: rate || undefined,
             pitch: pitch || undefined,
             label: label || '',
-            verify: verify !== false
+            verify: verify !== false,
+            convert: convert === false ? false : undefined
           }),
           headers: { 'x-agent-token': token },
           timeoutMs: 300000
