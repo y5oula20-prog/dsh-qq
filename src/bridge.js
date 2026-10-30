@@ -21,6 +21,7 @@ import { mdToPlain, splitForQQ, truncateText, truncateTextTail } from './md-to-p
 import { SENSITIVE_RE } from './sensitive.js';
 import { looksLikeUnfinished } from './v2-wait.js';
 import { compactModelMessage } from './qq-model-view.js';
+import { BACKFILL_DEFAULTS, normalizeBackfillConfig, createUpstreamGapTracker, createSeenMessageIds, selectBackfill, describeDuration, backfillNoticeBlock } from './backfill.js';
 import { safeFetchBuffer, looksLikeImageBuffer } from './safe-fetch.js';
 import { stickerMaxBytes } from './lib/sticker-limits.mjs';
 import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, inspectAudio, listAudioFiles, parseTargetKey, processAudioVolume, resolveAudioProcessing, resolveAudioSource, safeJoinLibrary } from './send-voice-lib.js';
@@ -744,7 +745,12 @@ function loadConfig() {
       allowRemote: false,
       ...(file.dsh ?? {})
     },
-    snowluma: { wsUrl: 'ws://127.0.0.1:3001', accessToken: '', ...(file.snowluma ?? {}) },
+    snowluma: {
+      wsUrl: 'ws://127.0.0.1:3001',
+      accessToken: '',
+      ...(file.snowluma ?? {}),
+      backfill: { ...BACKFILL_DEFAULTS, ...(file.snowluma?.backfill ?? {}) }
+    },
     // 空 => 每个会话在 state/agents/<key> 下建独立工作目录
     sessionCwd: file.sessionCwd ?? '',
     agentPreset: file.agentPreset ?? 'qq-chat',
@@ -4658,6 +4664,116 @@ async function main() {
   function noteUpstreamPacket(kind) {
     snowlumaHealth.lastPacketAt = Date.now();
     snowlumaHealth.lastPacketKind = String(kind ?? '');
+    // 两次事件包隔了太久：中间断过（电脑睡眠、NapCat 重启、桥接停过），恢复后补收错过的消息（见 src/backfill.js）
+    const gap = upstreamGap.notePacket(normalizeBackfillConfig(cfg.snowluma?.backfill).gapMs);
+    if (gap) scheduleBackfill(gap);
+  }
+
+  // ── 断线期间错过的消息：恢复后补收（逻辑在 src/backfill.js）──────────────────────
+  const upstreamGap = createUpstreamGapTracker({ file: path.join(STATE_DIR, 'upstream-seen.json'), onError: (e) => log('补收：记录最后事件时间失败', e?.message ?? e) });
+  const seenMsgIds = createSeenMessageIds();
+  const backfillNotices = new Map(); // key -> { gapMs, count, earliestAgeMs }：下一次唤醒告诉 AI 未读里有补收的消息
+  let backfillPending = null; // { since, gapMs }
+  let backfillTimer = null;
+  let backfillRunning = null;
+  // 拉历史失败的会话（实测：Mac 半睡半醒时连接刚通、NapCat 实例还没起来，请求全失败）：
+  // 记下这个会话最早还没补上的时间，过一会儿重试；之后再断线，这个会话也从更早的时间开始补，不会漏掉中间那段。
+  const backfillUnfinished = new Map(); // key -> since
+  const BACKFILL_RETRY_MS = 60_000;
+  const BACKFILL_RETRY_MAX = 5;
+  let backfillRetryCount = 0;
+  let backfillRetryTimer = null;
+  function scheduleBackfill(gap) {
+    const c = normalizeBackfillConfig(cfg.snowluma?.backfill);
+    if (!c.enabled) return;
+    log(`[backfill] 和 QQ 的连接断过${describeDuration(gap.gapMs)}（最后一个事件包在 ${new Date(gap.since).toLocaleTimeString('zh-CN', { hour12: false })}），${Math.round(c.settleMs / 1000)} 秒后补收错过的消息`);
+    backfillPending = backfillPending ? { since: Math.min(backfillPending.since, gap.since), gapMs: Math.max(backfillPending.gapMs, gap.gapMs) } : gap;
+    if (backfillTimer) return;
+    backfillTimer = setTimeout(() => {
+      backfillTimer = null;
+      const job = backfillPending; backfillPending = null;
+      backfillRunning = (backfillRunning ?? Promise.resolve()).then(() => runBackfill(job)).catch((e) => log('[backfill] 补收出错', e?.message ?? e));
+    }, c.settleMs);
+    backfillTimer.unref?.();
+  }
+  /** 补收的对象：当前模式允许的群和私聊（有会话或有二代状态的），管理员私聊总在里面。 */
+  function backfillTargets() {
+    const keys = new Set([...Object.keys(state.sessions), ...socialV2.conversations.keys()]);
+    if (cfg.ownerQQ) keys.add(`private:${String(cfg.ownerQQ)}`);
+    return [...keys].filter((k) => /^(group|private):\d+$/.test(k) && isSessionAllowedInCurrentMode(k)).slice(0, 40);
+  }
+  async function runBackfill({ since, gapMs }) {
+    const c = normalizeBackfillConfig(cfg.snowluma?.backfill);
+    if (!c.enabled) return { skipped: 'disabled' };
+    if (currentMode !== 'reserved2' || cfg.socialV2?.enabled === false) {
+      // 其它模式会把补收的旧消息逐条交给模型回复，不补；只提醒一下
+      log(`[backfill] 当前不是二代仿真，没有补收；断线${describeDuration(gapMs)}期间的消息可能错过了`);
+      appendActivity(`和 QQ 的连接断过${describeDuration(gapMs)}，当前模式不补收，这段时间的消息可能错过了`);
+      return { skipped: 'mode' };
+    }
+    const summary = [];
+    const ownerCommands = [];
+    const failed = [];
+    for (const key of backfillTargets()) {
+      const [kind, id] = key.split(':');
+      // 上次没补上的会话：从它更早的那个时间开始补
+      const keySince = Math.min(since, backfillUnfinished.get(key) ?? since);
+      let res;
+      let failReason = '';
+      try {
+        res = kind === 'group'
+          ? await bot.request('get_group_msg_history', { group_id: Number(id), count: c.maxPerConversation })
+          : await bot.request('get_friend_msg_history', { user_id: Number(id), count: c.maxPerConversation });
+        if (!res || res.status !== 'ok' || res.retcode !== 0) failReason = String(res?.wording || res?.retcode || '无回执');
+      } catch (error) { failReason = String(error?.message ?? error); }
+      if (failReason) {
+        log(`[backfill] ${key} 拉历史消息失败：${failReason}`);
+        backfillUnfinished.set(key, keySince);
+        failed.push(key);
+        continue;
+      }
+      backfillUnfinished.delete(key);
+      const { items, skippedCommands } = selectBackfill(res.data?.messages, { key, since: keySince, seen: seenMsgIds, config: c });
+      if (kind === 'private' && String(id) === String(cfg.ownerQQ ?? '')) ownerCommands.push(...skippedCommands);
+      else if (skippedCommands.length) log(`[backfill] ${key} 有 ${skippedCommands.length} 条命令类消息，补收时不执行`);
+      let fresh = 0;
+      for (const item of items) {
+        try {
+          await handleIncoming(kind, id, item.event, cfg, { backfill: item });
+          if (!item.tooOld) fresh += 1;
+        } catch (error) { log(`[backfill] ${key} 补收一条消息出错：${error?.message ?? error}`); }
+      }
+      if (items.length) {
+        if (fresh) backfillNotices.set(key, { gapMs, count: items.length, earliestAgeMs: items[0].ageMs });
+        summary.push(`${key} ${items.length} 条${fresh < items.length ? `（${items.length - fresh} 条太旧，只记下不唤醒）` : ''}`);
+      }
+    }
+    if (ownerCommands.length) {
+      const preview = ownerCommands.slice(0, 5).map((x) => String(x.event?.raw_message ?? '').replace(/\d{6}/g, '******').slice(0, 30)).join('、');
+      void sendOwnerDirect(`⚠️ 桥接和 QQ 断开过${describeDuration(gapMs)}，这段时间你发的 ${ownerCommands.length} 条命令 / 确认没有执行：${preview}。需要的话请重发。`);
+    }
+    const failText = failed.length ? `；${failed.length} 个会话没拉到历史（QQ 可能还没完全恢复）` : '';
+    log(summary.length ? `[backfill] 补收完成：${summary.join('；')}${failText}` : `[backfill] 补收完成：${failed.length ? `没拉到历史${failText.slice(1)}` : '断线期间没有错过的消息'}`);
+    if (summary.length) appendActivity(`和 QQ 的连接断过${describeDuration(gapMs)}，已补收：${summary.join('；')}${failText}`);
+    // 有会话没拉到：过一会儿重试（最多 BACKFILL_RETRY_MAX 次）；都拉到了就清零
+    let retryInMs = 0;
+    if (!failed.length) backfillRetryCount = 0;
+    else if (backfillRetryCount < BACKFILL_RETRY_MAX) {
+      backfillRetryCount += 1;
+      retryInMs = BACKFILL_RETRY_MS;
+      log(`[backfill] ${Math.round(retryInMs / 1000)} 秒后重试没拉到的会话（第 ${backfillRetryCount}/${BACKFILL_RETRY_MAX} 次）`);
+      clearTimeout(backfillRetryTimer);
+      backfillRetryTimer = setTimeout(() => {
+        backfillRetryTimer = null;
+        backfillRunning = (backfillRunning ?? Promise.resolve()).then(() => runBackfill({ since, gapMs })).catch((e) => log('[backfill] 补收出错', e?.message ?? e));
+      }, retryInMs);
+      backfillRetryTimer.unref?.();
+    } else {
+      backfillRetryCount = 0;
+      log(`[backfill] 重试 ${BACKFILL_RETRY_MAX} 次仍没拉到：${failed.join('、')}；下次断线恢复时会从更早的时间一起补`);
+      appendActivity(`和 QQ 的连接断过${describeDuration(gapMs)}，有 ${failed.length} 个会话的历史消息一直没拉到，这段时间的消息可能错过了（下次断线恢复时会再补）`);
+    }
+    return { summary, ownerCommands: ownerCommands.length, failed, retryInMs };
   }
 
   /** 记下一次接收链路健康度。@param good - boolean；非布尔值忽略。 */
@@ -11786,6 +11902,7 @@ async function main() {
       // 管理员托付在这次最终构建里已经写进提示词，取走，避免下次唤醒重复交代。
       ownerRelayStore.take(key);
       scheduledNotes.take(key);
+      backfillNotices.delete(key);
       wakeSnapshot = buildWakeSnapshotV2(key);
       if (wakeSnapshot) {
         promptText += `\n\n【本次消息快照】\n${JSON.stringify(wakeSnapshot)}\n以上消息已提供，无需重复查询；partial=true 时用 qq_get_unread_messages(afterSeq=readThroughSeq) 继续读取。先处理当前消息；回复前如需确认后续补充，用 qq_wait_for_messages(purpose="reply") 补足短静默，已安静够久会立即返回，不要先长等。收尾只确认你已处理的 readThroughSeq（本地 seq，非 QQ messageId），传给 qq_mark_read 或 qq_set_wake_config 的 throughSeq；新到消息留待处理。`;
@@ -12478,7 +12595,7 @@ async function main() {
   }
 
   // ── 二代仿真模式（reserved2）唤醒调度 ──────────────────────────────────
-  function appendSocialV2Message(key, sender, textContent, plainContent, quoteTargetIsSelf, isOwner, messageId, media = [], userId = null, forwardIds = []) {
+  function appendSocialV2Message(key, sender, textContent, plainContent, quoteTargetIsSelf, isOwner, messageId, media = [], userId = null, forwardIds = [], extra = {}) {
     const st = getSocialV2State(key);
     const recentLimit = Number(cfg.socialV2?.context?.recentLimit) || 100;
     const unreadLimit = Number(cfg.socialV2?.context?.unreadLimit) || 30;
@@ -12531,7 +12648,9 @@ async function main() {
       hasMedia: safeMedia.length > 0,
       forwardIds: safeForwardIds,
       hasForward: safeForwardIds.length > 0,
-      time: Date.now()
+      // 补收的消息记原始发送时间，并标上 backfill（AI 读未读时能看到这是断线期间错过、刚补收的）
+      time: Number.isFinite(extra.time) ? extra.time : Date.now(),
+      ...(extra.backfill ? { backfill: true } : {})
     };
     st.lastUnreadSeq = msg.seq;
     st.lastIncomingAt = Date.now();
@@ -12903,6 +13022,8 @@ async function main() {
     const notes = scheduledNotes.peek(key);
     if (reason === 'scheduled' && !notes.length) reason = '定时任务的说明已过期，按平常判断即可';
     let text = buildWakePromptV2Core(key, reason);
+    const bfNotice = backfillNotices.get(key);
+    if (bfNotice) text = `${backfillNoticeBlock(bfNotice)}\n\n${text}`;
     // 角色卡换了 / 改了、这个会话还没读到：把新卡全文放在最前面（引导唤醒会自己调用 qq_get_prompt，不重复给）
     const roleBlock = roleRefreshBlockV2(key, reason);
     if (roleBlock) text = `${roleBlock}\n\n${text}`;
@@ -13577,12 +13698,19 @@ async function main() {
     return `已在群 ${gid} 发送。`;
   }
 
-  async function handleIncoming(kind, id, event, cfg) {
+  async function handleIncoming(kind, id, event, cfg, opts = {}) {
     const key = convKey(kind, id);
+    // 补收（src/backfill.js）：断线期间错过、恢复后从历史接口拉回来的消息。只当聊天内容记下：
+    // 不执行任何命令 / 审批 / 确认码 / 角色切换，只在二代仿真里进未读。
+    const backfill = opts.backfill || null;
+    const incomingId = event?.message_id ?? event?.msg_id;
+    if (backfill && seenMsgIds.has(key, incomingId)) return;
+    seenMsgIds.add(key, incomingId);
+    if (backfill && currentMode !== 'reserved2') return;
     // ── v0.3.0 owner 管理通道：在**任何**模式与白名单判断之前拦截 ──────────────────
     // 只认 owner 的私聊（私聊对象与发送者都必须是 ownerQQ）。这里处理的消息绝不交给模型：
     // 确认码、TOTP 动态码、管理命令、审批回复。群里的同类命令在下面被拒绝。
-    if (kind === 'private' && ext.adminEnabled()
+    if (!backfill && kind === 'private' && ext.adminEnabled()
         && String(event.user_id) === String(cfg.ownerQQ ?? '') && String(id) === String(cfg.ownerQQ ?? '')) {
       const ownerText = (await segmentsToText(event.message ?? [], { includeReply: false })).trim();
       if (ownerText) {
@@ -13668,13 +13796,16 @@ async function main() {
       ext.observeMessage({ kind, id: String(id), event, directedAtSelf: quoteTargetIsSelf || atSelf || kind === 'private' });
     }
 
+    // 补收的消息到这里为止只做记录类的事：命令、审批、挂起提问的回答、角色切换一律不处理
+    if (backfill && (plainContent.startsWith('/') || /进入角色扮演|退出角色扮演|切换角色|设置角色|改角色|换角色|关闭角色扮演|开启角色扮演/.test(plainContent))) return;
+
     // v0.3.0 审批：带编号的回复（多个挂起时必须带编号）。
-    if (await tryHandleApprovalReply(key, plainContent, isOwner)) return;
+    if (!backfill && await tryHandleApprovalReply(key, plainContent, isOwner)) return;
 
     // 若该会话有挂起的提问/审批，先当作回答处理（用当前消息自己的文字，不含引用原文）。
     // 审批只有管理员消息会被消费；群友消息不能因为“审批挂起”而被吞掉，应继续走正常处理。
     const p = pending.get(key);
-    if (p && (p.kind === 'question' || isOwner)) {
+    if (!backfill && p && (p.kind === 'question' || isOwner)) {
       await handlePendingAnswer(p, plainContent, key, isOwner);
       return;
     }
@@ -13857,7 +13988,11 @@ async function main() {
     // 二代仿真模式（reserved2）：唤醒调度
     if (currentMode === 'reserved2') {
       const sender = kind === 'group' ? (event.sender?.card || event.sender?.nickname || String(event.user_id)) : '私聊';
-      appendSocialV2Message(key, sender, textContent, plainContent, quoteTargetIsSelf, isOwner, event.message_id ?? event.msg_id ?? null, mediaList, event.user_id ?? null, mergeForwardIds(extractForwardIds(event.message ?? []), quotedForwardIds));
+      appendSocialV2Message(key, sender, textContent, plainContent, quoteTargetIsSelf, isOwner, event.message_id ?? event.msg_id ?? null, mediaList, event.user_id ?? null, mergeForwardIds(extractForwardIds(event.message ?? []), quotedForwardIds), backfill ? { time: backfill.timeMs, backfill: true } : {});
+      if (backfill?.tooOld) {
+        appendActivity(`${key} [reserved2] 补收（太旧，只记下不唤醒）：${textContent.slice(0, 80)}`);
+        return;
+      }
       // 二代同样收集群聊黑话学习素材（AI 自主提交之外，桥接仍自动提取高频陌生词）
       if (kind === 'group') {
         feedSlangWindow(key, sender, plainContent);
