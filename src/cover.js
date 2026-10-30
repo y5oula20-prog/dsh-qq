@@ -19,6 +19,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const HOME = process.env.HOME || '/Users/caizhiqiang';
@@ -38,6 +39,8 @@ export function defaultCoverConfig(cfg) {
     // 跑 demucs 用的 python（rvc venv 里装了 demucs）
     demucsPython: c.demucsPython || path.join(HOME, 'Applications/rvc/.venv310/bin/python'),
     ffmpegPath: c.ffmpegPath || '',
+    // SVC 推理设备：auto 会优先 mps（M3 上比 cpu 快约 4 倍），失败自动回退 cpu
+    device: c.device || 'auto',
     // 音色参考：3–10 秒单人干净人声
     refAudioPath: c.refAudioPath || '',
     // 段长限制：太长 CPU 跑不动
@@ -50,6 +53,16 @@ export function defaultCoverConfig(cfg) {
     timeoutMs: Number(c.timeoutMs) > 0 ? Number(c.timeoutMs) : 3600000,
     workDir: path.resolve(c.workDir || path.join(HOME, 'Applications/cover-work'))
   };
+}
+
+/** 文件内容指纹（用于缓存 f0 等派生文件）。 */
+function hashFile(filePath) {
+  try {
+    const buf = fs.readFileSync(filePath);
+    return crypto.createHash('sha1').update(buf).digest('hex').slice(0, 12);
+  } catch {
+    return 'missing';
+  }
 }
 
 function resolveFfmpeg(cfg) {
@@ -152,38 +165,37 @@ export async function coverSong({
   fs.mkdirSync(outDir, { recursive: true });
   const t0 = Date.now();
 
-  // ① 分离人声 / 伴奏
+  // ① 先按时间切原始音频，再分离。
+  //    反过来的话整首 3 分钟歌都要跑一遍 demucs（约 40s），而只取 16 秒只要 5s。
+  onStep(`切段 ${start}–${end}s`);
+  const ffmpeg = resolveFfmpeg(cfg);
+  const songSeg = path.join(work, 'song_seg.wav');
+  await run(ffmpeg, [
+    '-v', 'error', '-y', '-ss', String(start), '-to', String(end),
+    '-i', songPath, '-ar', '44100', songSeg
+  ], { timeoutMs: 180000, label: 'ffmpeg 切段' });
+
+  // ② 分离人声 / 伴奏（只分离切出来的这一段）
   onStep('分离人声与伴奏');
   const sepRoot = path.join(work, 'sep');
   await run(cfg.demucsPython, [
-    '-m', 'demucs', '--two-stems=vocals', '-n', 'htdemucs', '-o', sepRoot, songPath
+    '-m', 'demucs', '--two-stems=vocals', '-n', 'htdemucs', '-o', sepRoot, songSeg
   ], { env: { OMP_NUM_THREADS: '4' }, timeoutMs: 1800000, label: 'demucs 分离' });
-  const stemDir = path.join(sepRoot, 'htdemucs', path.basename(songPath, path.extname(songPath)));
-  const vocals = path.join(stemDir, 'vocals.wav');
-  const accomp = path.join(stemDir, 'no_vocals.wav');
-  if (!fs.existsSync(vocals)) throw new Error('demucs 没产出 vocals.wav');
-
-  // ② 切段（人声与伴奏必须切同一段，否则混音会错位）
-  onStep(`切段 ${start}–${end}s`);
-  const ffmpeg = resolveFfmpeg(cfg);
-  const vocalSeg = path.join(work, 'vocal_seg.wav');
-  const accompSeg = path.join(work, 'accomp_seg.wav');
-  for (const [src, dst] of [[vocals, vocalSeg], [accomp, accompSeg]]) {
-    await run(ffmpeg, [
-      '-v', 'error', '-y', '-ss', String(start), '-to', String(end),
-      '-i', src, '-ar', '44100', dst
-    ], { timeoutMs: 180000, label: 'ffmpeg 切段' });
-  }
+  const stemDir = path.join(sepRoot, 'htdemucs', path.basename(songSeg, path.extname(songSeg)));
+  const vocalSeg = path.join(stemDir, 'vocals.wav');
+  const accompSeg = path.join(stemDir, 'no_vocals.wav');
+  if (!fs.existsSync(vocalSeg)) throw new Error('demucs 没产出 vocals.wav');
 
   // ③ f0 曲线（目标=原唱人声，参考=音色源）
+  //    参考音色的 f0 只取决于参考音频本身，跟唱哪首歌无关 → 缓存到 workDir 复用。
   onStep('提取音高曲线');
-  const refF0 = path.join(work, 'ref_f0.npy');
-  await extractF0(cfg, cfg.refAudioPath, refF0);
+  const refF0 = path.join(cfg.workDir, `ref_f0_${hashFile(cfg.refAudioPath)}.npy`);
+  if (!fs.existsSync(refF0)) await extractF0(cfg, cfg.refAudioPath, refF0);
   const tgtF0 = path.join(work, 'target_f0.npy');
   await extractF0(cfg, vocalSeg, tgtF0);
 
   // ④ SVC 换音色
-  onStep('换音色（CPU，这一步最慢）');
+  onStep('换音色（这一步最慢）');
   const svcOut = path.join(work, 'svc');
   fs.mkdirSync(svcOut, { recursive: true });
   // 必须用 fileURLToPath：pathname 不会解码中文路径，会把「鲸鱼工作室」变成 %E9%B2%B8...
@@ -195,7 +207,7 @@ export async function coverSong({
     '--target', vocalSeg,
     '--target-f0', tgtF0,
     '--out-dir', svcOut,
-    '--device', 'cpu',
+    '--device', cfg.device || 'auto',
     '--n-steps', String(cfg.steps)
   ], {
     cwd: cfg.srcDir,
