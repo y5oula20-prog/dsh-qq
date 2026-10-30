@@ -2408,7 +2408,8 @@ async function main() {
           textLang: gc.textLang,
           mediaType: gc.mediaType,
           outDir: vc.dir,
-          timeoutMs: gc.timeoutMs
+          timeoutMs: gc.timeoutMs,
+          loudnessLufs: gc.loudnessLufs
         });
         synthPath = g.path;
         speechPath = g.path;
@@ -7681,7 +7682,8 @@ async function main() {
                   textLang: gc.textLang,
                   mediaType: gc.mediaType,
                   outDir: vc.dir,
-                  timeoutMs: gc.timeoutMs
+                  timeoutMs: gc.timeoutMs,
+                  loudnessLufs: gc.loudnessLufs
                 });
                 synth = { path: g.path, bytes: g.bytes, voice: gc.refAudioPath, engine: 'gsv', text: sanitizeSpeechText(text, tc.maxChars), reused: g.reused };
                 sayPath = g.path;

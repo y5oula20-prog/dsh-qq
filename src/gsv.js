@@ -31,7 +31,12 @@ export function defaultGsvConfig(cfg) {
     mediaType: String(g.mediaType || 'wav'),
     timeoutMs: Number(g.timeoutMs) > 0 ? Number(g.timeoutMs) : 120000,
     // 说话要不要走克隆音色。关掉就退回 edge-tts + RVC 那条链。
-    speech: g.speech !== false
+    speech: g.speech !== false,
+    // 响度归一：GPT-SoVITS 原始输出偏响（实测 -16 LUFS），QQ 语音条听着炸。
+    // 填 0 / false 关闭；默认 -19 LUFS（语音条舒服区间）。
+    loudnessLufs: Number(g.loudnessLufs) === 0 || g.loudnessLufs === false
+      ? 0
+      : (Number(g.loudnessLufs) || -19)
   };
 }
 
@@ -60,14 +65,15 @@ export async function gsvSpeak({
   textLang = 'zh',
   mediaType = 'wav',
   outDir,
-  timeoutMs = 120000
+  timeoutMs = 120000,
+  loudnessLufs = 0
 } = {}) {
   if (!outDir) throw new Error('缺少 outDir（语音库目录）');
   if (!refAudioPath) throw new Error('缺少 refAudioPath（参考音频，3–10 秒单人声）');
   fs.mkdirSync(outDir, { recursive: true });
 
   const hash = crypto.createHash('sha1')
-    .update(`${refAudioPath}|${promptText}|${textLang}|${text}`)
+    .update(`${refAudioPath}|${promptText}|${textLang}|${text}|lu:${loudnessLufs}`)
     .digest('hex').slice(0, 10);
   const outPath = path.join(outDir, `gsv-${hash}.wav`);
   try {
@@ -99,8 +105,66 @@ export async function gsvSpeak({
     const buf = Buffer.from(await res.arrayBuffer());
     if (!buf.length) throw new Error('GPT-SoVITS 返回了空音频');
     fs.writeFileSync(outPath, buf);
-    return { path: outPath, bytes: buf.length, reused: false };
+
+    // 响度归一：GPT-SoVITS 原始输出实测 -16 LUFS / 峰值 -1.5dB，发到 QQ 听着炸。
+    // 用 ffmpeg loudnorm 拉到目标 LUFS（默认 -19），失败就照发原音，不让整条语音作废。
+    if (loudnessLufs) {
+      try {
+        const normed = await normalizeLoudness(outPath, loudnessLufs);
+        if (normed) return { path: outPath, bytes: normed, reused: false, normalized: true };
+      } catch {}
+    }
+    return { path: outPath, bytes: fs.statSync(outPath).size, reused: false };
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * 把音频响度拉到 targetLufs（原地覆盖）。失败返回 null，调用方照发原音。
+ * QQ 语音条舒服区间约 -19 ~ -20 LUFS；GPT-SoVITS 原始输出约 -16 LUFS 明显偏响。
+ */
+async function normalizeLoudness(filePath, targetLufs) {
+  const { spawnSync } = await import('node:child_process');
+  const ffmpeg = process.env.FFMPEG_PATH ||
+    ['/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg', '/usr/bin/ffmpeg']
+      .find((p) => { try { return fs.existsSync(p); } catch { return false; } }) ||
+    'ffmpeg';
+
+  // 两遍 loudnorm：第一遍只测量，第二遍用 measured_* 精确对齐。
+  // 单遍模式实测只能从 -16.1 拉到 -17.8（目标 -19），差 1.2 LUFS 不够。
+  const probe = spawnSync(ffmpeg, [
+    '-hide_banner', '-i', filePath,
+    '-af', `loudnorm=I=${targetLufs}:TP=-2.0:LRA=11:print_format=json`,
+    '-f', 'null', '-'
+  ], { encoding: 'utf8', timeout: 60000 });
+  const raw = `${probe.stderr || ''}`;
+  const m = raw.lastIndexOf('{');
+  const j = m >= 0 ? raw.slice(m, raw.lastIndexOf('}') + 1) : '';
+  let measured = null;
+  try { measured = JSON.parse(j); } catch {}
+  if (!measured || !measured.input_i) return null;
+
+  const tmp = `${filePath}.norm.wav`;
+  const r = spawnSync(ffmpeg, [
+    '-v', 'error', '-y', '-i', filePath,
+    '-af', [
+      `loudnorm=I=${targetLufs}:TP=-2.0:LRA=11`,
+      `measured_I=${measured.input_i}`,
+      `measured_TP=${measured.input_tp}`,
+      `measured_LRA=${measured.input_lra}`,
+      `measured_thresh=${measured.input_thresh}`,
+      `offset=${measured.target_offset}`,
+      'linear=true'
+    ].join(':'),
+    '-ar', '32000', '-ac', '1', tmp
+  ], { encoding: 'utf8', timeout: 60000 });
+  if (r.status !== 0 || r.error) {
+    try { fs.unlinkSync(tmp); } catch {}
+    return null;
+  }
+  const size = fs.statSync(tmp).size;
+  if (size < 1024) { try { fs.unlinkSync(tmp); } catch {} return null; }
+  fs.renameSync(tmp, filePath);
+  return size;
 }
