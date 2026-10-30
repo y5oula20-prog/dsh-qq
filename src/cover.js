@@ -206,20 +206,46 @@ export async function coverSong({
   const svcWav = path.join(svcOut, 'generated.wav');
   if (!fs.existsSync(svcWav)) throw new Error('SVC 没产出 generated.wav');
 
-  // ⑤ 混回伴奏 + 限幅 + 响度归一
+  // ⑤ 混回伴奏 + 限幅（先出无损，响度单独做，见下）
   onStep('混回伴奏');
-  const outFile = path.join(outDir, `${tag}.mp3`);
+  const mixedWav = path.join(work, 'mixed.wav');
   const mixFilters = [
     '[0:a]aresample=44100,aformat=channel_layouts=stereo[v]',
     '[1:a]aresample=44100,aformat=channel_layouts=stereo[a]',
     '[v][a]amix=inputs=2:duration=longest:normalize=0,alimiter=limit=0.95'
   ];
-  if (cfg.loudnessLufs) mixFilters[2] += `,loudnorm=I=${cfg.loudnessLufs}:TP=-1.0:LRA=11`;
   await run(ffmpeg, [
     '-v', 'error', '-y', '-i', svcWav, '-i', accompSeg,
     '-filter_complex', mixFilters.join(';'),
-    '-c:a', 'libmp3lame', '-b:a', '192k', outFile
+    '-ar', '44100', mixedWav
   ], { timeoutMs: 300000, label: 'ffmpeg 混音' });
+
+  // ⑥ 响度归一（两遍法）。单遍 loudnorm 在长音频上会差 2 dB 以上，
+  //    第一遍只测量、第二遍带 measured_* 精确对齐，说话语音那边踩过同一个坑。
+  const outFile = path.join(outDir, `${tag}.mp3`);
+  let measured = null;
+  if (cfg.loudnessLufs) {
+    onStep('响度归一');
+    const probe = await run(ffmpeg, [
+      '-hide_banner', '-i', mixedWav,
+      '-af', `loudnorm=I=${cfg.loudnessLufs}:TP=-1.0:LRA=11:print_format=json`,
+      '-f', 'null', '-'
+    ], { timeoutMs: 300000, label: 'loudnorm 测量' });
+    const txt = `${probe.err || ''}${probe.out || ''}`;
+    const i = txt.lastIndexOf('{');
+    const j = txt.lastIndexOf('}');
+    if (i >= 0 && j > i) {
+      try { measured = JSON.parse(txt.slice(i, j + 1)); } catch {}
+    }
+  }
+  const loudFilter = measured
+    ? `loudnorm=I=${cfg.loudnessLufs}:TP=-1.0:LRA=11:measured_I=${measured.input_i}:measured_TP=${measured.input_tp}:measured_LRA=${measured.input_lra}:measured_thresh=${measured.input_thresh}:offset=${measured.target_offset}:linear=true`
+    : (cfg.loudnessLufs ? `loudnorm=I=${cfg.loudnessLufs}:TP=-1.0:LRA=11` : 'anull');
+  await run(ffmpeg, [
+    '-v', 'error', '-y', '-i', mixedWav,
+    '-af', `${loudFilter},alimiter=limit=0.97`,
+    '-ar', '44100', '-c:a', 'libmp3lame', '-b:a', '192k', outFile
+  ], { timeoutMs: 300000, label: 'ffmpeg 出 mp3' });
 
   const bytes = fs.statSync(outFile).size;
   return {
