@@ -1873,6 +1873,27 @@ async function main() {
     });
   }
 
+  // ── ACE-Step 按需回收：唱完空闲 60s 自动停，把 ~16GB Metal 共享内存还给系统 ──
+  // 为什么 60s：连续点两首歌时不会二次冷启动（冷启动实测 ~70s）；唱完就停又会
+  // 让「紧接着再唱一首」白等一次。60s 是折中，比出歌等待（45s）略长。
+  // 复用 start-acestep.sh 已内置的 --stop（pkill），不新造停止逻辑；停失败只记日志，
+  // 不影响已经唱出来的歌。
+  let aceStepIdleTimer = null;
+  function scheduleAceStepIdleStop() {
+    if (aceStepIdleTimer) clearTimeout(aceStepIdleTimer);
+    aceStepIdleTimer = setTimeout(() => {
+      aceStepIdleTimer = null;
+      try {
+        execFileSync('sh', [path.join(ROOT, 'scripts', 'start-acestep.sh'), '--stop'], {
+          cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'ignore', 'ignore'], timeout: 30000,
+        });
+        log('[selfheal] acestep 已按需停掉，释放内存');
+      } catch (error) {
+        log(`[selfheal] acestep 自动停失败：${error?.message ?? error}`);
+      }
+    }, 60_000);
+  }
+
   // RVC 只探「常驻服务有没有在跑」——rvcHealth 的 ok 语义是「功能可用」，
   // 服务没起但有 CLI 兜底时它仍返回 ok:true，不能拿来判断要不要拉起常驻服务。
   async function rvcServerProbe(rc) {
@@ -2469,55 +2490,60 @@ async function main() {
     if (send) voiceBudgetCheck(key, vc);
     // 自愈：ACE-Step 服务没起就先拉起（不是开机自启，是这一秒要用才起）。
     await ensureAceStep(sc);
-    const outDir = sc.outDir ? path.resolve(sc.outDir) : vc.dir;
-    const song = await singWithAceStep({
-      apiUrl: sc.apiUrl,
-      apiKey: sc.apiKey,
-      lyrics: clean,
-      style: style ? String(style) : sc.style,
-      durationSec: dur,
-      steps: sc.steps,
-      model: sc.model,
-      lmModel: sc.lmModel,
-      vocalLanguage: sc.vocalLanguage,
-      thinking: sc.thinking,
-      guidanceScale: sc.guidanceScale,
-      outDir,
-      timeoutMs: sc.timeoutMs,
-      pollMs: sc.pollMs
-    });
-    log(`[sing] ${key} 唱好了 ${path.basename(song.path)}（${song.bytes} B，${Math.round(song.ms / 1000)}s，task=${song.taskId}）`);
-    appendActivity(`${key} [sing] 唱了一首歌（${dur}s，${Math.round(song.ms / 1000)}s 出歌）`);
+    try {
+      const outDir = sc.outDir ? path.resolve(sc.outDir) : vc.dir;
+      const song = await singWithAceStep({
+        apiUrl: sc.apiUrl,
+        apiKey: sc.apiKey,
+        lyrics: clean,
+        style: style ? String(style) : sc.style,
+        durationSec: dur,
+        steps: sc.steps,
+        model: sc.model,
+        lmModel: sc.lmModel,
+        vocalLanguage: sc.vocalLanguage,
+        thinking: sc.thinking,
+        guidanceScale: sc.guidanceScale,
+        outDir,
+        timeoutMs: sc.timeoutMs,
+        pollMs: sc.pollMs
+      });
+      log(`[sing] ${key} 唱好了 ${path.basename(song.path)}（${song.bytes} B，${Math.round(song.ms / 1000)}s，task=${song.taskId}）`);
+      appendActivity(`${key} [sing] 唱了一首歌（${dur}s，${Math.round(song.ms / 1000)}s 出歌）`);
 
-    // 换声：ACE-Step 每次发挥的音色都不一样，说话却是固定的晓伊，
-    // 不统一的话听起来就是两个人。RVC 只换音色、不动旋律和咬字。
-    // convert 三态：null=按配置默认；true=强制换；false=不换（留原声对比用）
-    let finalPath = song.path;
-    let rvcInfo = null;
-    const wantConvert = convert === null ? rvcCfg().enabled : convert === true;
-    if (wantConvert) {
-      try {
-        // 自愈：RVC 常驻服务没起就先拉起，让换声走快通道（2.4s）而不是 CLI（6.9s）。
-        await ensureRvc(rvcCfg());
-        const r = await convertVoice({ inPath: song.path, outDir, cfg: rvcCfg() });
-        rvcInfo = r;
-        finalPath = r.path;
-        log(`[sing] ${key} 换声完成 ${path.basename(r.path)}（${r.bytes} B，${Math.round(r.ms / 1000)}s）`);
-        appendActivity(`${key} [sing] 换成了小柚的音色（${Math.round(r.ms / 1000)}s）`);
-      } catch (error) {
-        // 换声失败不该让整首歌作废——原声照样能发，只是音色不统一
-        log(`[sing] ${key} 换声失败，发原声：${error?.message ?? error}`);
-        appendActivity(`${key} [sing] 换声失败，发原声`);
+      // 换声：ACE-Step 每次发挥的音色都不一样，说话却是固定的晓伊，
+      // 不统一的话听起来就是两个人。RVC 只换音色、不动旋律和咬字。
+      // convert 三态：null=按配置默认；true=强制换；false=不换（留原声对比用）
+      let finalPath = song.path;
+      let rvcInfo = null;
+      const wantConvert = convert === null ? rvcCfg().enabled : convert === true;
+      if (wantConvert) {
+        try {
+          // 自愈：RVC 常驻服务没起就先拉起，让换声走快通道（2.4s）而不是 CLI（6.9s）。
+          await ensureRvc(rvcCfg());
+          const r = await convertVoice({ inPath: song.path, outDir, cfg: rvcCfg() });
+          rvcInfo = r;
+          finalPath = r.path;
+          log(`[sing] ${key} 换声完成 ${path.basename(r.path)}（${r.bytes} B，${Math.round(r.ms / 1000)}s）`);
+          appendActivity(`${key} [sing] 换成了小柚的音色（${Math.round(r.ms / 1000)}s）`);
+        } catch (error) {
+          // 换声失败不该让整首歌作废——原声照样能发，只是音色不统一
+          log(`[sing] ${key} 换声失败，发原声：${error?.message ?? error}`);
+          appendActivity(`${key} [sing] 换声失败，发原声`);
+        }
       }
-    }
 
-    if (!send) {
-      return { file: finalPath, sourceFile: song.path, bytes: rvcInfo?.bytes ?? song.bytes, ms: song.ms + (rvcInfo?.ms ?? 0), taskId: song.taskId, lyrics: clean, converted: !!rvcInfo, sent: false };
+      if (!send) {
+        return { file: finalPath, sourceFile: song.path, bytes: rvcInfo?.bytes ?? song.bytes, ms: song.ms + (rvcInfo?.ms ?? 0), taskId: song.taskId, lyrics: clean, converted: !!rvcInfo, sent: false };
+      }
+      const sent = await sendVoiceForV2(key, finalPath, { label: label || clean.split(/\n/)[0].slice(0, 40), verify });
+      voiceBudgetCommit(key);
+      recordVoiceSentV2(key, sent, label || '唱了一首歌');
+      return { ...sent, file: finalPath, sourceFile: song.path, bytes: rvcInfo?.bytes ?? song.bytes, ms: song.ms + (rvcInfo?.ms ?? 0), taskId: song.taskId, lyrics: clean, converted: !!rvcInfo };
+    } finally {
+      // 唱完（无论成功/超时/换声失败/发送失败）都安排 60s 后停服务，避免 16GB 永久占着
+      scheduleAceStepIdleStop();
     }
-    const sent = await sendVoiceForV2(key, finalPath, { label: label || clean.split(/\n/)[0].slice(0, 40), verify });
-    voiceBudgetCommit(key);
-    recordVoiceSentV2(key, sent, label || '唱了一首歌');
-    return { ...sent, file: finalPath, sourceFile: song.path, bytes: rvcInfo?.bytes ?? song.bytes, ms: song.ms + (rvcInfo?.ms ?? 0), taskId: song.taskId, lyrics: clean, converted: !!rvcInfo };
   }
 
   /** 画画频率记账：按小时限流（云端出图要花钱，本地出图要占机器）。 */
