@@ -32,6 +32,7 @@ import { transcribeVoice, defaultAsrConfig } from './asr.js';
 import { singWithAceStep, normalizeLyrics, aceStepHealth, defaultSongConfig } from './song.js';
 import { convertVoice, rvcHealth, defaultRvcConfig } from './rvc.js';
 import { gsvSpeak, gsvHealth, defaultGsvConfig } from './gsv.js';
+import { coverSong, coverHealth, defaultCoverConfig } from './cover.js';
 import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } from './snowluma-conn.js';
 import { hardenDir, manualDirCommand } from './state-acl.mjs';
 import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardResponse } from './forward.js';
@@ -1836,6 +1837,13 @@ async function main() {
     return defaultGsvConfig(g);
   }
 
+  function coverCfg() {
+    const c = { ...(cfg.socialV2?.cover ?? {}) };
+    // 没单配音色参考就跟着说话走（同一个声音，才像同一个人）
+    if (!c.refAudioPath) c.refAudioPath = cfg.socialV2?.gsv?.refAudioPath || '';
+    return defaultCoverConfig(c);
+  }
+
   // ── 服务自愈：探服务 → 不在就 spawn start-*.sh --bg 并等就绪 ─────────────
   // 不是开机自启（用户 m01498 明确不要）：服务平时不占内存，只有小柚真要
   // 唱/说/换声的那一刻才临时拉起。拉不起来按各自通道既有兜底走：
@@ -2551,6 +2559,63 @@ async function main() {
       // 唱完（无论成功/超时/换声失败/发送失败）都安排 60s 后停服务，避免 16GB 永久占着
       scheduleAceStepIdleStop();
     }
+  }
+
+  /**
+   * 翻唱：把一首现成的歌的人声换成小柚的音色，伴奏原样保留。
+   * 与 singForV2 的区别是「唱什么」——singForV2 是 AI 照歌词作曲，
+   * coverForV2 是拿一首真歌只换唱的人，旋律咬字编曲全部保留。
+   *
+   * 注意耗时：SVC 纯 CPU，16 秒歌约 3 分钟，长歌会很久。调用方要留足超时，
+   * 而且桥这边是串行处理，翻唱期间别的语音会排队。
+   */
+  async function coverForV2(key, { songPath, startSec = 0, durationSec, label = '', verify = null, send = true } = {}) {
+    const cc = coverCfg();
+    const vc = voiceCfg();
+    if (!cc.enabled) throw new Error('翻唱功能已关闭（socialV2.cover.enabled=false）');
+    if (!vc.enabled) throw new Error('语音功能已关闭（socialV2.voice.enabled=false）');
+    if (!songPath) throw new Error('songPath 不能为空（给一个本地音频绝对路径，或用 source 从语音库找）');
+
+    // 路径解析三种形态：绝对路径直接用；相对路径先按进程 cwd（项目根）找；
+    // 还找不到才当语音库文件名（注意 vc.dir 已经是 audio，不能再拼一次 audio/）。
+    const rawSong = String(songPath);
+    const candidates = [];
+    if (path.isAbsolute(rawSong)) {
+      candidates.push(rawSong);
+    } else {
+      candidates.push(path.resolve(rawSong));
+      candidates.push(path.join(vc.dir, rawSong));
+      try { candidates.push(safeJoinLibrary(vc.dir, rawSong)); } catch {}
+    }
+    const resolved = candidates.find((p) => { try { return fs.existsSync(p); } catch { return false; } });
+    if (!resolved) throw new Error(`原曲不存在，试过：${[...new Set(candidates)].join('、')}`);
+
+    const health = coverHealth(cc);
+    if (!health.ok) throw new Error(`翻唱环境不完整，缺：${health.missing.join('、')}`);
+
+    if (send) voiceBudgetCheck(key, vc);
+    const outDir = vc.dir;
+    const tag = `cover-${Date.now().toString(36)}`;
+
+    const cover = await coverSong({
+      songPath: resolved,
+      startSec,
+      durationSec,
+      outDir,
+      tag,
+      cfg: cc,
+      onStep: (t) => log(`[cover] ${key} ${t}`)
+    });
+    log(`[cover] ${key} 翻唱完成 ${path.basename(cover.path)}（${cover.bytes} B，${cover.seconds}s 片段，耗时 ${Math.round(cover.ms / 1000)}s）`);
+    appendActivity(`${key} [cover] 翻唱了一段 ${cover.seconds}s（耗时 ${Math.round(cover.ms / 1000)}s）`);
+
+    if (!send) {
+      return { file: cover.path, vocalFile: cover.vocalPath, bytes: cover.bytes, seconds: cover.seconds, ms: cover.ms, sent: false };
+    }
+    const sent = await sendVoiceForV2(key, cover.path, { label: label || '翻唱', verify });
+    voiceBudgetCommit(key);
+    recordVoiceSentV2(key, sent, label || '翻唱了一首歌');
+    return { ...sent, file: cover.path, vocalFile: cover.vocalPath, bytes: cover.bytes, seconds: cover.seconds, ms: cover.ms };
   }
 
   /** 画画频率记账：按小时限流（云端出图要花钱，本地出图要占机器）。 */
@@ -7797,6 +7862,46 @@ async function main() {
           return;
         }
 
+        // ── 翻唱（操作者通道：拿现成的歌换小柚音色） ───────────────────────────
+        // 与 /api/operator/sing 的分工：sing 是 AI 从歌词作曲，cover 是给现成的歌换唱的人。
+        // noSend=true 只出成品不发，用来验收。
+        if (req.method === 'POST' && url.pathname === '/api/operator/cover') {
+          const body = await readBody();
+          const cc = coverCfg();
+          if (!cc.enabled) { sendJson({ ok: false, error: '翻唱功能已关闭（socialV2.cover.enabled=false）' }, 403); return; }
+          const key = String(body.target ?? body.key ?? '').trim();
+          const noSend = body.noSend === true || body.dryRun === true;
+          if (!noSend) {
+            const parsedTarget = parseTargetKey(key);
+            if (!parsedTarget) { sendJson({ ok: false, error: 'target 格式应为 group:群号 或 private:QQ号' }, 400); return; }
+            if (!modeAllowed(key, parsedTarget.kind, Number(parsedTarget.id), cfg, currentMode)) {
+              sendJson({ ok: false, error: `目标 ${key} 不在白名单内` }, 403);
+              return;
+            }
+          }
+          try {
+            const out = await coverForV2(key || 'operator:local', {
+              songPath: String(body.songPath ?? body.file ?? ''),
+              startSec: body.startSec,
+              durationSec: body.durationSec,
+              label: body.label ? String(body.label).slice(0, 100) : '',
+              verify: body.verify,
+              send: !noSend
+            });
+            sendJson({ ok: true, ...out });
+          } catch (error) {
+            sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
+          }
+          return;
+        }
+
+        // ── 翻唱环境健康检查 ────────────────────────────────────────────────
+        if (req.method === 'GET' && url.pathname === '/api/operator/cover-health') {
+          const cc = coverCfg();
+          sendJson({ ok: true, ...coverHealth(cc), workDir: cc.workDir, refAudioPath: cc.refAudioPath });
+          return;
+        }
+
         // ── ACE-Step 健康检查（操作者通道） ──────────────────────────────────
         if (req.method === 'GET' && url.pathname === '/api/operator/song-health') {
           const sc = songCfg();
@@ -8001,6 +8106,54 @@ async function main() {
               detail: out.detail,
               verified: out.verification?.confirmed === true,
               lyrics: out.lyrics
+            });
+          } catch (error) {
+            sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
+          }
+          return;
+        }
+
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/cover') {
+          const body = await readBody();
+          const token = String(body.token ?? req.headers['x-agent-token'] ?? '').trim();
+          const key = String(body.key ?? body.target ?? '').trim();
+          const cc = coverCfg();
+          const voice = voiceCfg();
+          if (!cc.enabled) { sendJson({ ok: false, error: '翻唱功能已关闭（socialV2.cover.enabled=false）' }, 403); return; }
+          if (!voice.enabled) { sendJson({ ok: false, error: '语音功能已关闭（socialV2.voice.enabled=false）' }, 403); return; }
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空（格式 group:群号 或 private:QQ号）' }, 400); return; }
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!token) { sendJson({ ok: false, error: 'reserved2 模式发送必须携带 agent token' }, 403); return; }
+          if (!agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!v2ToolEnabled('cover')) { sendJson({ ok: false, error: '工具未启用：qq_cover' }, 403); return; }
+          if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (shouldBlockSilentReply(key)) { sendJson({ ok: false, error: '静默模式已开启，当前不允许发送（计划内省 token 时段，不是故障；请勿重试或改用别的发送工具，静默结束后会自动补一次唤醒）' }, 403); return; }
+          const keyMatch = /^(group|private):(\d+)$/.exec(key);
+          if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
+          if (!modeAllowed(key, keyMatch[1], Number(keyMatch[2]), cfg, currentMode)) {
+            sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403);
+            return;
+          }
+          const songPath = String(body.songPath ?? body.file ?? '').trim();
+          if (!songPath) { sendJson({ ok: false, error: 'songPath 不能为空（原曲的本地路径，或语音库里的文件名）' }, 400); return; }
+          try {
+            const out = await coverForV2(key, {
+              songPath,
+              startSec: body.startSec,
+              durationSec: body.durationSec,
+              label: body.label ? String(body.label).slice(0, 100) : '',
+              verify: body.verify
+            });
+            sendJson({
+              ok: true,
+              key,
+              messageId: out.messageId,
+              file: out.file,
+              bytes: out.bytes,
+              seconds: out.seconds,
+              ms: out.ms,
+              detail: out.detail,
+              verified: out.verification?.confirmed === true
             });
           } catch (error) {
             sendJson({ ok: false, error: error?.message ?? String(error) }, 500);

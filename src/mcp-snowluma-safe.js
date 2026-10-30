@@ -331,6 +331,7 @@ const TOOL_CONFIG_FLAGS = {
   qq_say: 'sendVoice',
   qq_draw: 'draw',
   qq_sing: 'sing',
+  qq_cover: 'cover',
   qq_list_voices: 'sendVoice',
   // 下面这些曾经漏登记。漏一个不是"多注册一个工具"那么轻：桥接那边按 `v2ToolEnabled(flag)`
   // 在**调用期**一律 403，而这里不登记就等于"控制台显示已关闭、模型每次请求仍收到它的完整
@@ -1387,6 +1388,43 @@ if (cfg.socialV2?.song?.enabled !== false && cfg.socialV2?.tools?.sing !== false
         return { content: [{ type: 'text', text: serializeModelData(data) }] };
       } catch (error) {
         return { content: [{ type: 'text', text: `唱歌失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.socialV2?.cover?.enabled !== false && cfg.socialV2?.tools?.cover !== false) {
+  server.tool(
+    'qq_cover',
+    '翻唱：把一首**已有的歌**的人声换成自己的音色，伴奏原样保留，做出来像「自己唱了这首歌」。和 qq_sing 的区别：qq_sing 是照着歌词让 AI 作曲演唱（唱的是新歌、音色会飘），qq_cover 是拿一首真歌只换唱的人（旋律、咬字、编曲全保留）。songPath 给原曲的本地路径（必须在语音库里或绝对路径）。注意：① **很慢**，纯 CPU 跑，16 秒的片段约 3 分钟，30 秒约 5-6 分钟，别一次要太长；② 默认取 30 秒，最长 120 秒；③ 和 qq_say/qq_sing 共用发送频率额度；④ 想从中间开始唱就传 startSec；⑤ verified=true 才表示语音条真的发出去了。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      songPath: z.string().describe('原曲：语音库里的文件名，或本地音频绝对路径'),
+      startSec: z.number().optional().describe('可选：从第几秒开始翻唱，默认 0'),
+      durationSec: z.number().optional().describe('可选：片段长度秒数，默认 30，最长 120'),
+      label: z.string().optional().describe('可选：写进会话记录的说明，如「翻了一段小星星」'),
+      verify: z.boolean().optional().describe('是否回读校验（默认 true）')
+    },
+    async ({ key, token, songPath, startSec, durationSec, label, verify }) => {
+      try {
+        const data = await agentApi('/api/socialV2/cover', {
+          method: 'POST',
+          body: JSON.stringify({
+            key,
+            token,
+            songPath: String(songPath),
+            startSec,
+            durationSec,
+            label: label || '',
+            verify: verify !== false
+          }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 3600000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `翻唱失败：${error?.message ?? error}` }], isError: true };
       }
     }
   );
