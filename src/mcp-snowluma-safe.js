@@ -367,6 +367,14 @@ const TOOL_CONFIG_FLAGS = {
   qq_growth_note: 'growth',
   qq_growth_query: 'growth',
   qq_growth_clear: 'growth',
+  // 角色日记（一天一篇，她自己写）
+  qq_diary_write: 'diary',
+  qq_diary_read: 'diary',
+  // 屏蔽某人（她有权把使唤/辱骂她的人拉黑，24h 自动解封）
+  qq_ignore_person: 'ignorePerson',
+  qq_ignore_clear: 'ignorePerson',
+  // 告状通道：她被欺负时 @ 柚宝诉苦（单向只发给 owner 私聊）
+  qq_tell_owner: 'tellOwner',
 };
 const disabledTools = [];
 {
@@ -1070,6 +1078,112 @@ server.tool(
       return { content: [{ type: 'text', text: serializeModelData(data) }] };
     } catch (error) {
       return { content: [{ type: 'text', text: `成长笔记清空失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_diary_write',
+  '写你自己今天的日记（state/diary/YYYY-MM-DD.md，覆盖写）。在柚宝私聊里、他@你道晚安之后，把今天沉淀下来：和柚宝、和群里的互动，以及你今天的感受。只能在柚宝的私聊里写，一天一篇，写的只能是今天。',
+  {
+    key: z.string().describe('会话 key（必须是管理员私聊 private:<ownerQQ>）'),
+    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    content: z.string().describe('日记正文，你自己的第一人称感受')
+  },
+  async ({ key, token, content }) => {
+    try {
+      const data = await agentApi('/api/socialV2/diary', {
+        method: 'POST',
+        body: JSON.stringify({ key, content }),
+        headers: { 'x-agent-token': token }
+      });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `日记写入失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_diary_read',
+  '读你自己的日记（state/diary/YYYY-MM-DD.md）。date 省略读今天，也可指定 YYYY-MM-DD 读最近某天。只在需要回忆自己前几天记过什么时才用。',
+  {
+    key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    date: z.string().optional().describe('可选，YYYY-MM-DD；省略读今天')
+  },
+  async ({ key, token, date }) => {
+    try {
+      const data = await agentApi(`/api/socialV2/diary?key=${encodeURIComponent(key)}${date ? `&date=${encodeURIComponent(date)}` : ''}`, { headers: { 'x-agent-token': token } });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `日记读取失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_ignore_person',
+  '屏蔽群里某个使唤你、辱骂你、颐指气使的群友（24 小时自动解封）。你被欺负时有权这么做：屏蔽期内这个人的任何消息都不会再唤醒你。userId 用消息里的 userId（QQ 号），不是名字。不能屏蔽柚宝。',
+  {
+    key: z.string().describe('会话 key，格式 group:群号'),
+    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    userId: z.string().describe('要屏蔽的群友 QQ 号（来自消息的 userId）')
+  },
+  async ({ key, token, userId }) => {
+    try {
+      const data = await agentApi('/api/socialV2/ignore-person', {
+        method: 'POST',
+        body: JSON.stringify({ key, userId }),
+        headers: { 'x-agent-token': token }
+      });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `屏蔽失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_ignore_clear',
+  '解除对某个群友的屏蔽（userId 省略则清空本群全部屏蔽）。你气消了、或对方好好说话了，可以主动解封。',
+  {
+    key: z.string().describe('会话 key，格式 group:群号'),
+    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    userId: z.string().optional().describe('要解封的群友 QQ 号；省略清空全部')
+  },
+  async ({ key, token, userId }) => {
+    try {
+      const data = await agentApi('/api/socialV2/ignore-clear', {
+        method: 'POST',
+        body: JSON.stringify({ key, userId: userId || '' }),
+        headers: { 'x-agent-token': token }
+      });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `解封失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_tell_owner',
+  '被欺负时 @ 柚宝告状：把话带到柚宝的私聊里（单向，不会回群）。照实说——谁、哪句话、你怎么不舒服。他会替你出面。别为了告状而告状，也别憋着硬吞。',
+  {
+    key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    message: z.string().describe('要带给柚宝的话，照实说')
+  },
+  async ({ key, token, message }) => {
+    try {
+      const data = await agentApi('/api/socialV2/tell-owner', {
+        method: 'POST',
+        body: JSON.stringify({ key, message }),
+        headers: { 'x-agent-token': token }
+      });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `告状发送失败：${error?.message ?? error}` }], isError: true };
     }
   }
 );

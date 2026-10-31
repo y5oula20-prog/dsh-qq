@@ -128,6 +128,8 @@ import {
 import { MemoryService, defaultDbFile, parseStructuredDistill, parseLegacyMemoryFile, siftLegacyEntries, buildStructuredDistillSection } from './memory/index.js';
 // 角色成长笔记（「自主升级」块）：state/growth/<角色名>.md 的读写 + 注入块 + 配额文件。
 import { growthFileFor, readTextSafe as readGrowthText, ensureGrowthFile, appendGrowthNote, resetGrowthFile, buildGrowthPromptBlock } from './growth.js';
+// 角色日记：state/diary/YYYY-MM-DD.md 的读写 + 注入块（她自己写，不是程序调 API 生成）。
+import { diaryFileFor, diaryDateOf, writeDiary, readDiaryRaw, readDiaryBody, buildDiaryPromptBlock, DIARY_INJECT_DAYS, DIARY_INJECT_MAX_CHARS } from './diary.js';
 // v0.3.0：人际连续性（人物库/入群事件/跨群协作）与 owner 管理通道（模式切换/权限分级/审批增强）。
 // 业务规则全部在 src/social/* 与 src/admin/*，这里只接线。
 import { createBridgeExtensions, redactCredentials, normalizeMemberNotice, processMemberEvent, joinWakeInstruction, checkCrossGroup, queryPresence, queryActivity, resolveLevelPlan, permissionCommandSucceeded, L0_MODES, LEVEL_TEXT, parseOwnerCommandForGuard, createReconnectWatchdog, describeAgentError, agentErrorUserText, isConfigError, resolveDshBaseUrl, ownerRelayConfig, validateOwnerRelay, createOwnerRelayLimiter, createOwnerRelayStore, ownerRelayPromptBlock, ownerRelayResultText, ownerRelayNoticeText, GROUP_RULE_LIMITS, validateOwnerGroupAccess, normalizeRules, addRule, removeRule, rulesPromptBlock, peekView, groupRuleResultText, groupRuleNoticeText, isNapCatVersionInfo, looksLikePathOnlyError, stickerTempBase, writeTempSticker, findFavByMd5, napcatAddOk, qqBackendFromVersionInfo, qqBackendLabel, createDshHealth } from './bridge-extensions.js';
@@ -1033,6 +1035,12 @@ function loadConfig() {
     ownerGroupAccess: false,
     // 角色成长笔记（自主升级）：AI 往 state/growth/<角色名>.md 追加自己的认识
     growth: true,
+    // 角色日记：AI 自己写 state/diary/YYYY-MM-DD.md（一天一篇，覆盖写）
+    diary: true,
+    // 屏蔽某人：她有权把使唤/辱骂她的人拉黑（24 小时自动解封），屏蔽期内该人的任何消息都不触发唤醒
+    ignorePerson: true,
+    // 告状通道：她可以 @ 柚宝诉苦（单向只发给 owner 私聊，不会回群）
+    tellOwner: true,
     // 表情回应（NapCat set_msg_emoji_like）：给消息贴 QQ 系统表情
     emojiLike: true,
     ...(cfg.socialV2.tools ?? {})
@@ -1108,6 +1116,19 @@ function loadConfig() {
     maxChars: 2000,
     maxLines: 40,
     ...((cfg.socialV2?.growth && typeof cfg.socialV2.growth === 'object' && !Array.isArray(cfg.socialV2.growth)) ? cfg.socialV2.growth : {})
+  };
+
+  // socialV2.diary：角色日记（一天一篇 state/diary/YYYY-MM-DD.md，她自己写）。
+  // - enabled 总开关；injectDays / injectMaxChars 控制唤醒时注入最近几天的日记。
+  // - reminderTime 是兜底：到点（默认 21:30）由桥接保证唤醒 owner 私聊会话写今天的日记。
+  // - maxChars：单篇日记正文上限（见 src/diary.js）。
+  cfg.socialV2.diary = {
+    enabled: true,
+    injectDays: 3,
+    injectMaxChars: 900,
+    reminderTime: '21:30',
+    maxChars: 2000,
+    ...((cfg.socialV2?.diary && typeof cfg.socialV2.diary === 'object' && !Array.isArray(cfg.socialV2.diary)) ? cfg.socialV2.diary : {})
   };
 
   // socialV2.initialPromptMaxChars：会话「初始提示词」的字数上限。config.json 是用户可编辑的，
@@ -1637,6 +1658,7 @@ async function main() {
   const slangExtractionCooldowns = new Map(); // key -> timestamp
   const slangSubmitTimes = new Map();   // key -> [timestamp]：AI 提交黑话候选限频（内存态）
   const feedbackTimes = new Map();      // key -> [timestamp]：AI 反馈限频（内存态）
+  const tellOwnerTimes = new Map();     // key -> [timestamp]：AI 告状限频（内存态）
   const slangResearchingIds = new Set(); // 正在研究中的候选 id，防止重复排队
   const learnerSessions = new Set();    // sessionId -> 学习会话（不映射 QQ，不发送）
   const learnerCollectors = new Map();  // sessionId -> turn collector
@@ -3458,6 +3480,29 @@ async function main() {
     if (!text) return '';
     return buildGrowthPromptBlock(name, text, Number(cfg.socialV2?.growth?.injectMaxChars ?? 900));
   }
+  // ── 日记：状态读写 + 注入块 ──────────────────────────────────────────────
+  function diaryRoleName() {
+    return growthRoleName(); // 与成长笔记同源（当前启用角色）
+  }
+  function diaryBlockForRole() {
+    if (cfg.socialV2?.diary?.enabled === false) return '';
+    if (!diaryRoleName()) return '';
+    return buildDiaryPromptBlock(STATE_DIR, {
+      days: Number(cfg.socialV2?.diary?.injectDays ?? DIARY_INJECT_DAYS),
+      maxChars: Number(cfg.socialV2?.diary?.injectMaxChars ?? DIARY_INJECT_MAX_CHARS),
+    });
+  }
+  function diaryWriteAllowed(key) {
+    const cfg2 = cfg.socialV2?.diary ?? {};
+    if (cfg2.enabled === false) return { allowed: false, reason: '日记功能未开启' };
+    const canonical = canonicalV2Key(key);
+    if (!canonical) return { allowed: false, reason: '无效的会话 key' };
+    // 只有管理员私聊能写（她自己写日记时也是在这个会话被唤醒）；群聊不允许写。
+    if (canonical !== `private:${String(cfg.ownerQQ ?? '')}`) {
+      return { allowed: false, reason: '日记只能在柚宝的私聊里写' };
+    }
+    return { allowed: true };
+  }
   // 成长笔记配额：单独落盘 state/growth-quota.json（结构 { "YYYY-MM-DD": { "<key>": n } }）。
   // 不塞进 social-v2.json，因为 saveSocialV2State() 只序列化白名单字段，塞进去重启即丢。
   function growthQuotaLoad() {
@@ -4039,6 +4084,26 @@ async function main() {
     t.unref?.();
   }
   let schedulerStarted = false;
+  /** 日记兜底：确保存在一个每天 21:30 唤醒 owner 私聊写日记的定时任务（幂等，不重复建）。 */
+  function ensureDiaryReminderTask() {
+    if (cfg.socialV2?.diary?.enabled === false) return;
+    const name = '日记提醒';
+    const existing = scheduler.listTasks().find((t) => t.name === name && t.enabled);
+    if (existing) return;
+    try {
+      const t = scheduler.createTask({
+        name,
+        kind: 'ai',
+        instruction: '写今天的日记（用 qq_diary_write，覆盖写 state/diary/YYYY-MM-DD.md）。回忆今天和柚宝、和群里的互动，把今天沉淀成一篇第一人称的感受，别逐条流水账。',
+        targets: [schedulerOwnerKey()],
+        schedule: { type: 'daily', times: [String(cfg.socialV2?.diary?.reminderTime || '21:30')] },
+        runDuringSilence: true,
+      }, { source: 'owner-command' });
+      log(`日记兜底任务已登记 #${t.id}（每天 ${cfg.socialV2?.diary?.reminderTime || '21:30'}）`);
+    } catch (error) {
+      log(`⚠️ 日记兜底任务登记失败：${error?.message ?? error}`);
+    }
+  }
   function startSchedulerOnce() {
     if (schedulerStarted) return;
     schedulerStarted = true;
@@ -4047,6 +4112,7 @@ async function main() {
       const lines = missed.slice(0, 10).map((m) => `#${m.id}「${m.name}」${describeInstant(m.at, scheduler.snapshot().settings.timezone)}`);
       void sendOwnerDirect(`⏰ 桥接没运行期间错过了 ${missed.length} 个定时任务（超过补发时间，没有补发）：\n${lines.join('\n')}`);
     }
+    ensureDiaryReminderTask();
     scheduler.start();
   }
   /** 管理员私聊命令 /remind：桥接直接处理。返回要回复的文字；不是 /remind 返回 null。 */
@@ -9526,6 +9592,133 @@ async function main() {
           sendJson({ ok: true, key: key || null, role: growthRoleName(), growth: buildGrowthPromptBlock(growthRoleName() ?? '', text, Number(cfg.socialV2?.growth?.injectMaxChars ?? 900)), raw: text });
           return;
         }
+        // ── 角色日记（reserved2）：AI 自己写/读 state/diary/YYYY-MM-DD.md ─────
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/diary') {
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          const content = String(body.content ?? '').trim();
+          const dateStr = String(body.date ?? '').trim();
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+          if (!content) { sendJson({ ok: false, error: 'content 不能为空' }, 400); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('diary')) { sendJson({ ok: false, error: '工具未启用：qq_diary_write' }, 403); return; }
+          const allow = diaryWriteAllowed(key);
+          if (!allow.allowed) { sendJson({ ok: false, error: allow.reason || '日记写入被拒绝' }, 403); return; }
+          // date 只允许今天（她写的是「今天的日记」）；空则默认今天。拒绝跨天补写/未来日期。
+          const today = diaryDateOf();
+          const finalDate = dateStr || today;
+          if (finalDate !== today) { sendJson({ ok: false, error: `日记只能写今天（${today}）的` }, 400); return; }
+          const roleName = diaryRoleName() || '小柚';
+          const clean = redactKnownTokensOnly(content);
+          const file = diaryFileFor(STATE_DIR, finalDate);
+          const raw = writeDiary(file, clean, { dateStr: finalDate, roleName });
+          const body2 = readDiaryBody(file);
+          sendJson({ ok: true, key, date: finalDate, role: roleName, content: body2, raw });
+          return;
+        }
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/diary') {
+          const key = String(url.searchParams.get('key') ?? '').trim();
+          const dateStr = String(url.searchParams.get('date') ?? '').trim();
+          if (key) {
+            if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+            if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+            if (req.headers['x-agent-token'] && !v2ToolEnabled('diary')) { sendJson({ ok: false, error: '工具未启用：qq_diary_write' }, 403); return; }
+          }
+          const today = diaryDateOf();
+          const finalDate = dateStr || today;
+          // 读也只看最近几天，避免遍历任意日期。
+          const file = diaryFileFor(STATE_DIR, finalDate);
+          const raw = readDiaryRaw(file);
+          const body2 = raw ? readDiaryBody(file) : null;
+          sendJson({ ok: true, key: key || null, date: finalDate, today, role: diaryRoleName(), content: body2, raw });
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/diary-clear') {
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          const dateStr = String(body.date ?? '').trim() || diaryDateOf();
+          const isOwnerPrivate = key === `private:${String(cfg.ownerQQ ?? '')}`;
+          if (req.headers['x-agent-token']) {
+            if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+            if (!agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+            if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+            if (!isOwnerPrivate) { sendJson({ ok: false, error: '只有管理员私聊才能清空日记' }, 403); return; }
+          }
+          const file = diaryFileFor(STATE_DIR, dateStr);
+          fs.writeFileSync(file, `# ${dateStr} ${diaryRoleName() || '小柚'}的日记\n`, 'utf8');
+          sendJson({ ok: true, key: key || null, date: dateStr, role: diaryRoleName() });
+          return;
+        }
+        // ── 屏蔽某人（reserved2）：她主动拉黑使唤/辱骂她的群友，24h 自动解封 ───
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/ignore-person') {
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          const targetUserId = String(body.userId ?? '').trim();
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+          if (!/^[1-9]\d{4,12}$/.test(targetUserId)) { sendJson({ ok: false, error: 'userId 必须是有效的 QQ 号' }, 400); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('ignorePerson')) { sendJson({ ok: false, error: '工具未启用：qq_ignore_person' }, 403); return; }
+          // 只能屏蔽群成员；不能屏蔽柚宝本人、也不能屏蔽自己。
+          if (targetUserId === String(cfg.ownerQQ ?? '')) { sendJson({ ok: false, error: '不能屏蔽柚宝' }, 403); return; }
+          const canonical = canonicalV2Key(key);
+          if (!canonical || !canonical.startsWith('group:')) { sendJson({ ok: false, error: '屏蔽只能在群里用' }, 403); return; }
+          const st = getSocialV2State(canonical);
+          const until = Date.now() + 24 * 60 * 60 * 1000;
+          st.ignoredUsers = st.ignoredUsers && typeof st.ignoredUsers === 'object' ? st.ignoredUsers : {};
+          st.ignoredUsers[targetUserId] = until;
+          saveSocialV2State();
+          sendJson({ ok: true, key: canonical, ignoredUserId: targetUserId, until, untilText: '24 小时后自动解封' });
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/ignore-clear') {
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          const targetUserId = String(body.userId ?? '').trim();
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('ignorePerson')) { sendJson({ ok: false, error: '工具未启用：qq_ignore_person' }, 403); return; }
+          const canonical = canonicalV2Key(key);
+          if (!canonical) { sendJson({ ok: false, error: '无效的会话 key' }, 400); return; }
+          const st = getSocialV2State(canonical);
+          if (targetUserId) {
+            if (st.ignoredUsers && typeof st.ignoredUsers === 'object') delete st.ignoredUsers[targetUserId];
+          } else {
+            st.ignoredUsers = {};
+          }
+          saveSocialV2State();
+          sendJson({ ok: true, key: canonical, ignoredUsers: pruneIgnoredUsers(st.ignoredUsers) });
+          return;
+        }
+        // ── 告状通道（reserved2）：她被欺负时 @ 柚宝诉苦，单向只发给 owner 私聊 ──
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/tell-owner') {
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          const rawMessage = String(body.message ?? '').trim();
+          if (!key || !rawMessage) { sendJson({ ok: false, error: 'key 和 message 不能为空' }, 400); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('tellOwner')) { sendJson({ ok: false, error: '工具未启用：qq_tell_owner' }, 403); return; }
+          if (!cfg.ownerQQ) { sendJson({ ok: false, error: '没有配置管理员 QQ，告状无法送达' }, 500); return; }
+          // 告状限频：防止持有会话 token 的调用方刷 owner 私聊。
+          const tNow = Date.now();
+          const tTimes = tellOwnerTimes.get(key) || [];
+          const tRecentHour = tTimes.filter((t) => tNow - t < 3600000).length;
+          if (tRecentHour >= 10) { sendJson({ ok: false, error: '告状过于频繁，先缓一缓' }, 429); return; }
+          tTimes.push(tNow);
+          tellOwnerTimes.set(key, tTimes.slice(-100));
+          const maxLength = Math.max(1, Number(cfg.socialV2?.tellOwner?.maxLength) || 500);
+          const message = truncateText(rawMessage, maxLength);
+          const where = canonicalV2Key(key) || key;
+          // 单向发到 owner 私聊，不回群。前缀让柚宝一眼看出这是「她来找我告状」。
+          await sendOwnerDirect(`📣 小柚来找你告状了（来源 ${where}）：\n${message}`);
+          log(`[reserved2] 告状已发 owner (${where})：${message.slice(0, 80)}`);
+          appendActivity(`${key} [reserved2] 告状已发 owner：${message.slice(0, 80)}`);
+          sendJson({ ok: true, key, delivered: true });
+          return;
+        }
         // ── 二代黑话学习（reserved2）：AI 查询/提交黑话候选 ─────────────────
         if (req.method === 'GET' && url.pathname === '/api/socialV2/slang/query') {
           const key = String(url.searchParams.get('key') ?? '').trim();
@@ -11229,6 +11422,30 @@ async function main() {
     }
   }
 
+  // ── 屏蔽某人：她有权把使唤/辱骂她的人拉黑 24 小时 ─────────────────────────
+  // st.ignoredUsers 形如 { QQ号: 解封时间戳(ms) }；过期即视为解除。只对群聊有意义。
+  function pruneIgnoredUsers(ignoredUsers) {
+    const out = {};
+    const nowMs = Date.now();
+    if (ignoredUsers && typeof ignoredUsers === 'object') {
+      for (const [k, v] of Object.entries(ignoredUsers)) {
+        if (['__proto__', 'constructor', 'prototype'].includes(k)) continue;
+        const until = Number(v);
+        if (Number.isFinite(until) && until > nowMs) out[String(k)] = until;
+      }
+    }
+    return out;
+  }
+  function isIgnoredUser(st, userId) {
+    const id = String(userId ?? '');
+    if (!id) return false;
+    const map = st.ignoredUsers && typeof st.ignoredUsers === 'object' ? st.ignoredUsers : {};
+    const until = Number(map[id]);
+    if (!Number.isFinite(until)) return false;
+    if (until <= Date.now()) { delete map[id]; return false; } // 惰性解封
+    return true;
+  }
+
   function getSocialV2State(key) {
     // 只允许内部约定的会话 key 格式，并统一成无前导零的正整数形式，防止同一会话分裂成多个状态。
     const canonical = canonicalV2Key(key);
@@ -11268,6 +11485,7 @@ async function main() {
         pendingThoughts: [],
         memberImpressions: {},
         ownerRules: []          // 管理员设定的长期规则（只能经管理员私聊的 qq_owner_group_rule 改）
+        , ignoredUsers: {}      // 她主动屏蔽的群友：{ QQ号: 解封时间戳(ms) }，24h 自动过期
       };
       rememberAgentToken(key, st.agentToken);
       socialV2.conversations.set(key, st);
@@ -11345,7 +11563,18 @@ async function main() {
               }
               return clean;
             })(),
-            ownerRules: normalizeRules(val.ownerRules)
+            ownerRules: normalizeRules(val.ownerRules),
+            ignoredUsers: (() => {
+              const raw = (val.ignoredUsers && typeof val.ignoredUsers === 'object') ? val.ignoredUsers : {};
+              const clean = {};
+              const nowMs = Date.now();
+              for (const [k, v] of Object.entries(raw)) {
+                if (['__proto__', 'constructor', 'prototype'].includes(k)) continue;
+                const until = Number(v);
+                if (Number.isFinite(until) && until > nowMs) clean[String(k)] = until; // 过期即丢弃
+              }
+              return clean;
+            })()
           };
           // 旧状态/异常状态里的指定成员名单也统一归一化，防止“null”/非法值污染。
           if (st.wakeConfig?.triggers && typeof st.wakeConfig.triggers === 'object') {
@@ -11426,6 +11655,7 @@ async function main() {
           pendingThoughts: Array.isArray(st.pendingThoughts) ? st.pendingThoughts.slice(-50) : [],
           memberImpressions: st.memberImpressions && typeof st.memberImpressions === 'object' ? st.memberImpressions : {},
           ownerRules: normalizeRules(st.ownerRules),
+          ignoredUsers: pruneIgnoredUsers(st.ignoredUsers),
           seenForwardIds: Array.from(seenForwardIds.get(key) || []).slice(-1000)
         };
       }
@@ -12999,6 +13229,9 @@ async function main() {
 
   function evaluateWakeTriggerV2(key, st, event, kind, textContent, plainContent, quoteTargetIsSelf) {
     if (kind === 'private') return 'private';
+    // 她屏蔽了这个人（24h 内）：这个人的任何消息都不唤醒她，也不占用概率额度。
+    const senderId = String(event?.user_id ?? event?.sender?.user_id ?? '');
+    if (senderId && isIgnoredUser(st, senderId)) return null;
     const tr = st.wakeConfig?.triggers ?? {};
     if (tr.anyMessage) return 'anyMessage';
     if (tr.atMention) {
@@ -13211,6 +13444,9 @@ async function main() {
     // 角色成长笔记（自主升级块）：只注入当前启用角色自己的成长笔记。
     const growthText = growthBlockForRole();
     const growthLine = growthText ? `${growthText}\n\n` : '';
+    // 角色日记：只注入她最近几天自己写的日记（连续性），不注入空的。
+    const diaryText = diaryBlockForRole();
+    const diaryLine = diaryText ? `${diaryText}\n\n` : '';
     // v0.3.0 在场人物：只注入本轮未读/最近消息里出现的人，并在注入时按共享策略过滤可见范围。
     const presentIds = [...(st.unread || []), ...(st.recentMessages || []).slice(-6)].filter((m) => m && !m.isSelf).map((m) => m.userId).filter(Boolean);
     const peopleText = ext.peopleBlockFor(key, presentIds);
@@ -13268,7 +13504,7 @@ async function main() {
     const silenceLine = blockedReasonText
       ? `【此刻不能发言】${blockedReasonText}。所有发送接口（qq_send_message / qq_reply / qq_send_burst / qq_send_poke / qq_send_sticker / qq_send_voice）现在都会直接返回 403「静默模式已开启」，**不要调用它们、不要重试、也不要为了这件事上报管理员**——这是计划内的省 token 时段，不是故障。群消息照常收进来，你照样可以看、可以判断，只是话先憋着；等静默结束会自动补一次唤醒，那时再说。想收尾就按正常流程 qq_mark_read 或 qq_set_wake_config。\n\n`
       : '';
-    const base = silenceLine + roleLine + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + quoteLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + growthLine + peopleLine + participationLine + preSleepLine;
+    const base = silenceLine + roleLine + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + quoteLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + growthLine + diaryLine + peopleLine + participationLine + preSleepLine;
     if (reason === 'bootstrap') {
       return `${base}【引导唤醒】你已接入 QQ 会话 ${key}。\n当前是二代仿真模式：你的文本输出不会自动发送到 QQ，所有发言必须通过工具完成。\n请先调用 qq_get_prompt 查看角色、推荐值、可用工具和状态；有待回应的消息先按首回复节奏处理，最后才用 qq_set_wake_config 设置你希望如何被唤醒。`;
     }
