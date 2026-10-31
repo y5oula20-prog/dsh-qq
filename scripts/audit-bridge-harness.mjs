@@ -42,6 +42,8 @@ import * as asr from '../src/asr.js';
 import * as song from '../src/song.js';
 import * as rvc from '../src/rvc.js';
 import * as snowlumaConn from '../src/snowluma-conn.js';
+import * as backfill from '../src/backfill.js';
+import * as diary from '../src/diary.js';
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -55,6 +57,9 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     dsh: { authToken: 'fixture-only' }, ownerQQ: 123,
     allow: { private: ['123'], groups: ['456'] }, consolePort: 0,
     consoleToken: 'fixture-console-token', slang: { enabled: false },
+    // 日记兜底任务（ensureDiaryReminderTask）是生产行为，会抢占 scheduler task #1 并启动定时器；
+    // 单元测试不关心它，默认关掉，避免干扰 /remind 等断言里的任务 id 计数。
+    socialV2: { diary: { enabled: false } },
     // 逐条记忆库的旧记忆迁移默认指向不存在的文件：VM 里 process.env 是空桩，
     // 不钉住的话会去读**真实的** ~/.dsh/qq-bridge/memory.md，测试就被本机数据影响了。
     memory: { legacyFile: path.join(temp, 'no-legacy-memory.md') },
@@ -226,6 +231,9 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     // 曾经漏注入，导致 test-voice 等测试在 VM 里跑出 `defaultDbFile is not defined`。
     ...memoryLib,
     readGrowthText: growth.readTextSafe,
+    // 断线补收（backfill）与日记（diary）——bridge.js 在 :24 / :132 import 它们，
+    // harness 之前漏注入 backfill，导致 test-scheduler 在 VM 里跑出 `BACKFILL_DEFAULTS is not defined`。
+    ...backfill, ...diary,
     // ACL 收紧会 spawn icacls 去改**真实**文件系统；测试不该做这件事（同理见下面的
     // cleanupTemp / processAudioVolume 桩）。桩成成功，让 hardenStateDirAcl 走正常分支。
     hardenDir: () => ({ ok: true, detail: 'stub' }),
