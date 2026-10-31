@@ -162,6 +162,22 @@ const USELESS_IN_QQ_TOOLS = [
   'human_read', 'journal_read', 'journal_write', 'personality_select',
   // 工作目录切换（QQ 会话不该改 cwd）
   'working_directory',
+  // 2026-10-31：dsh-video-storyboard（给视频切宫格，桌面侧用）。
+  // 群聊里用不上。**故意不进 READONLY_AGENT_TOOLS**：它内部 spawn ffmpeg/ffprobe，
+  // 与 L1「不能执行命令」的边界相冲，宁可让 owner 在 L2/L3 用。
+  'video_probe', 'video_storyboard', 'video_zoom', 'video_locate', 'video_subtitles',
+  // 2026-10-31：memu 记忆（桌面侧独立记忆库）。
+  // scan-dsh-tool-names.mjs 把 memu_global_* 报成「危险语义未覆盖」：它们能读宿主的
+  // 全局记忆库，而 QQ 侧自有一套 memory/note_person 体系，两套不该串。
+  'memu_global_list', 'memu_global_recall', 'memu_status',
+  'memu_private_list', 'memu_private_recall', 'memu_private_remember',
+  'memu_private_update', 'memu_private_archive', 'memu_private_link',
+  'memu_private_unpin',
+  // 2026-10-31：阿里云百炼 MCP（mcp-bailian）。桌面侧做批量文本/识图用的，
+  // 群聊里每一次调用都会把 QQ 内容发到阿里云 —— 既用不上，也没必要开这个出口。
+  // 执行期白名单本来就拒（SAFE_PREFIXES 里没有它），这里补 restrict 是为了别占 schema。
+  'mcp__bailian__bailian_chat', 'mcp__bailian__bailian_embed',
+  'mcp__bailian__bailian_models', 'mcp__bailian__bailian_vision',
 ]
 
 const KNOWN_DANGEROUS_GLOBAL_TOOLS = [

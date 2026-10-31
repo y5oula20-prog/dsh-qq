@@ -97,18 +97,19 @@ console.log('## 配置文件');
   ok(!('sendCaptionMaxChars' in (cfg.socialV2?.sticker ?? {})), 'config sticker 不再包含 sendCaptionMaxChars');
 }
 
-console.log('## 表情单气泡约束');
+console.log('## 表情与文字同气泡（2026-10-31 契约反转）');
 {
+  // 历史：这里原本断言「qq_send_sticker 必须禁止文字与表情同气泡」，
+  // 依据是「QQ 一条消息只能一张图」。2026-10-31 核实后这条是伪限制 ——
+  // OneBot 消息段数组本来就能同时装 text 段和 image 段。于是契约反转：
+  // 现在要求「支持可选 text」，且描述/提示里不能再禁止同气泡。
   const mcp = fs.readFileSync(path.join(ROOT, 'src', 'mcp-snowluma-safe.js'), 'utf8');
   const sendStickerBlock = mcp.slice(mcp.indexOf("'qq_send_sticker'"), mcp.indexOf("'qq_sticker_note'"));
-  ok(!sendStickerBlock.includes('message: z.string()'), 'qq_send_sticker MCP 不再接受 message 参数');
-  ok(sendStickerBlock.includes('不能在同一气泡里附带文字'), 'qq_send_sticker 描述强调单气泡');
+  ok(sendStickerBlock.includes('text: z.string()'), 'qq_send_sticker MCP 提供可选 text 参数');
+  ok(!sendStickerBlock.includes('不能在同一气泡里附带文字'), 'qq_send_sticker 描述不再禁止同气泡');
   const hint = buildStickerStrategyHint();
-  // 断言的是「策略提示必须禁止表情与文字挤同一气泡」这条契约，而不是某一句固定文案。
-  // 10-28 改写 hint 语气时，句子从「不能在同一气泡里附带文字」变成
-  // 「表情不要和文字挤在同一个气泡里（这是 QQ 的限制，一条消息只能一张图）」，
-  // 意思没变、旧断言却挂了 —— 所以改成按语义锚点匹配，以后改措辞不会再误报。
-  ok(/同一个气泡|同一气泡/.test(hint) && /不要和文字|不能[^。]*文字/.test(hint), '策略提示禁止同气泡混文字');
+  ok(!hint.includes('不能和文字'), '策略提示不再禁止表情配文字');
+  ok(/text\s*参数/.test(hint), '策略提示说明可用 text 参数配字');
   ok(!hint.includes('先发一句话再发一张'), '策略提示不再引导“先发一句话再发一张”');
 }
 

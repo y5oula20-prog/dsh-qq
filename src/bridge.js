@@ -22,7 +22,7 @@ import { SENSITIVE_RE } from './sensitive.js';
 import { looksLikeUnfinished } from './v2-wait.js';
 import { compactModelMessage } from './qq-model-view.js';
 import { BACKFILL_DEFAULTS, normalizeBackfillConfig, createUpstreamGapTracker, createSeenMessageIds, selectBackfill, describeDuration, backfillNoticeBlock } from './backfill.js';
-import { safeFetchBuffer, looksLikeImageBuffer } from './safe-fetch.js';
+import { safeFetch, safeFetchBuffer, looksLikeImageBuffer } from './safe-fetch.js';
 import { stickerMaxBytes } from './lib/sticker-limits.mjs';
 import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, inspectAudio, listAudioFiles, parseTargetKey, processAudioVolume, resolveAudioProcessing, resolveAudioSource, safeJoinLibrary } from './send-voice-lib.js';
 import { synthesizeSpeech, normalizeTtsAdjust, sanitizeSpeechText } from './tts.js';
@@ -108,6 +108,19 @@ import {
   applyStickerNote,
   markStickerUsed
 } from './sticker-lib.js';
+// nekowhale「大肥鱼」公开表情套组（只读外部资源，与 QQ 收藏表情是两套，见 nekowhale-pack.js 头注释）
+import {
+  loadNekowhalePack,
+  saveNekowhalePack,
+  fetchNekowhaleMeta,
+  buildNekowhaleContext,
+  searchNekowhale,
+  findNekowhale,
+  ensureNekowhaleGif,
+  describeNekowhale,
+  nekowhaleGifUrl,
+  NEKOWHALE_PACK
+} from './nekowhale-pack.js';
 // 会话记忆（分群长期记忆）：移植自旧桥 group-memory 体系
 import {
   GROUP_MEMORY_TEMPLATE,
@@ -152,6 +165,10 @@ const MEMORY_SESSION_FILE = path.join(STATE_DIR, 'memory-session.json');
 // 单独一个文件：它属于操作者配置，不能随 social-v2.json 的会话状态一起被重置清掉。
 const INITIAL_PROMPTS_FILE = path.join(STATE_DIR, 'initial-prompts.json');
 const STICKER_FILE = path.join(STATE_DIR, 'stickers.json');
+// nekowhale 表情套组：元数据 + GIF 懒加载缓存（只读外部资源，不进 Git，见 .gitignore 的 state/）
+const NEKOWHALE_DIR = path.join(STATE_DIR, 'nekowhale');
+const NEKOWHALE_META_FILE = path.join(NEKOWHALE_DIR, 'nekowhale.json');
+const NEKOWHALE_GIF_DIR = path.join(NEKOWHALE_DIR, 'gifs');
 const FEEDBACK_FILE = path.join(STATE_DIR, 'feedback.json');
 const TOOL_LOG_FILE = path.join(STATE_DIR, 'tool-calls.jsonl');
 const TOKEN_USAGE_FILE = path.join(STATE_DIR, 'token-usage.jsonl');
@@ -1715,6 +1732,61 @@ async function main() {
   let stickerSyncedAt = 0; // 上次从 SnowLuma 拉取收藏表情的时间戳（毫秒）
   let lastForcedAgentStickerSync = 0; // AI 强制刷新表情库的最小间隔保护
 
+  // ── nekowhale「大肥鱼」表情套组（只读外部资源） ─────────────────────────────
+  // 与上面 QQ 收藏表情的分工见 src/nekowhale-pack.js 头注释：那边是「AI 认知层」，
+  // 这边是只读套组，不参与 merge 剔除，也没有 useCount 语义上的「收藏」含义。
+  // 元数据 160KB，启动时读本地缓存；没有缓存就后台拉一次，失败不影响启动。
+  let nekowhaleMeta = null;
+  let nekowhaleLoadedAt = 0;
+  let nekowhaleFetching = null;
+  try {
+    nekowhaleMeta = loadNekowhalePack(NEKOWHALE_META_FILE);
+  } catch (error) {
+    // 缓存读坏不能当空库覆盖（同 stickerEntries 的理由）；下次拉取成功会整体重写。
+    log(`⚠️ nekowhale 缓存读取失败，将重新拉取：${error?.message ?? error}`);
+    nekowhaleMeta = null;
+  }
+
+  // 拉取/刷新 nekowhale 元数据。并发调用共享同一个 in-flight promise，避免启动时打三次。
+  // 失败返回 null（调用方用旧缓存或降级为「没有这个套组」），绝不抛给消息主链路。
+  async function syncNekowhale(force = false) {
+    if (cfg.socialV2?.sticker?.enabled === false) return null;
+    const ttl = 12 * 3600 * 1000; // 元数据是作者手工更新的，12 小时刷新一次足够
+    if (!force && nekowhaleMeta && Date.now() - nekowhaleLoadedAt < ttl) return nekowhaleMeta;
+    if (nekowhaleFetching) return nekowhaleFetching;
+    nekowhaleFetching = (async () => {
+      try {
+        const meta = await fetchNekowhaleMeta(async (url) => {
+          // 元数据是 JSON 文本，必须走 safeFetch（safeFetchBuffer 会强制校验 PNG/JPEG/GIF/WebP
+          // 签名，对 JSON 一律抛「抓取内容不是有效图片」）。4MB 容量按 160KB 实测留足余量。
+          const res = await safeFetch(url, 4 * 1024 * 1024);
+          if (res.statusCode !== 200) throw new Error(`HTTP ${res.statusCode}`);
+          return res.body;
+        });
+        nekowhaleMeta = meta;
+        nekowhaleLoadedAt = Date.now();
+        try {
+          saveNekowhalePack(NEKOWHALE_META_FILE, meta);
+        } catch (error) {
+          log(`[nekowhale] 缓存写入失败（不影响使用）：${error?.message ?? error}`);
+        }
+        log(`[nekowhale] 已加载「${NEKOWHALE_PACK}」表情 ${meta.stickers.length} 张`);
+        return meta;
+      } catch (error) {
+        log(`[nekowhale] 元数据拉取失败（沿用本地缓存）：${error?.message ?? error}`);
+        return nekowhaleMeta;
+      } finally {
+        nekowhaleFetching = null;
+      }
+    })();
+    return nekowhaleFetching;
+  }
+
+  // 启动时后台预热一次：不让消息主链路等网络，也不让第一次发表情时才发现要拉元数据。
+  // 已经有缓存且未过期时 syncNekowhale() 会直接返回，不会产生请求。
+  setTimeout(() => { syncNekowhale(false).catch(() => {}); }, 3000);
+
+
   function stickerEnabled() {
     return cfg.socialV2?.sticker?.enabled !== false;
   }
@@ -1760,21 +1832,56 @@ async function main() {
   async function listStickersForV2(query = '', count = 48, force = false) {
     const synced = await syncStickerLibrary(force);
     const entries = synced?.entries ?? stickerEntries;
-    return formatStickerList(entries, query, count);
+    const result = formatStickerList(entries, query, count);
+    // nekowhale 是独立套组（只读、286 张、走 CDN 懒加载），单独一节返回，
+    // 不和 QQ 收藏表情混在同一个 stickers 数组里 —— 两者 id 命名空间不同，
+    // 混在一起会让 AI 分不清「这是我收藏的」还是「这是套组里的」。
+    const meta = await syncNekowhale(false);
+    if (meta?.stickers?.length) {
+      const hits = searchNekowhale(meta, query, Math.max(1, Math.min(48, Number(count) || 48)));
+      result.nekowhale = {
+        pack: meta.pack,
+        total: meta.stickers.length,
+        matched: hits.length,
+        stickers: hits.map((s) => ({
+          id: s.id,
+          emotion: s.emotion,
+          name: s.name,
+          tags: s.tags || [],
+          use: s.use,
+          desc: s.desc
+        }))
+      };
+    }
+    return result;
   }
 
-  // 取单个表情的图片字节（多模态用）。
+  // 统一查找：先找 QQ 收藏表情，找不到再找 nekowhale 套组。
+  // 返回 { kind: 'qq' | 'nekowhale', entry }，两者字段不同，由调用方按 kind 分支处理。
+  async function findAnySticker(stickerRef, { forceQq = false } = {}) {
+    const synced = await syncStickerLibrary(forceQq);
+    const qq = findSticker(synced?.entries ?? stickerEntries, stickerRef);
+    if (qq) return { kind: 'qq', entry: qq };
+    const meta = await syncNekowhale(false);
+    const nk = meta ? findNekowhale(meta, stickerRef) : null;
+    if (nk) return { kind: 'nekowhale', entry: nk };
+    return null;
+  }
+
+  // 取单个表情的图片字节（多模态用）。返回 { kind, entry }，kind 区分两套命名空间。
   async function getStickerImageData(stickerId) {
     const synced = await syncStickerLibrary(false);
     const entry = findSticker(synced?.entries ?? stickerEntries, stickerId);
-    if (!entry) {
-      // 本地没有时，尝试强制刷新一次再找（收藏可能在会话过程中新增）
-      const forced = await syncStickerLibrary(true);
-      const entry2 = findSticker(forced?.entries ?? stickerEntries, stickerId);
-      if (!entry2) throw new Error(`找不到表情 ${stickerId}，请先用 qq_list_stickers 获取有效 id`);
-      return entry2;
-    }
-    return entry;
+    if (entry) return { kind: 'qq', entry };
+    // 本地没有时，尝试强制刷新一次再找（收藏可能在会话过程中新增）
+    const forced = await syncStickerLibrary(true);
+    const entry2 = findSticker(forced?.entries ?? stickerEntries, stickerId);
+    if (entry2) return { kind: 'qq', entry: entry2 };
+    // QQ 收藏里没有，再看 nekowhale 套组（只读外部资源，不参与收藏同步）
+    const meta = await syncNekowhale(false);
+    const nk = meta ? findNekowhale(meta, stickerId) : null;
+    if (nk) return { kind: 'nekowhale', entry: nk };
+    throw new Error(`找不到表情 ${stickerId}，请先用 qq_list_stickers 获取有效 id`);
   }
 
   // ── 语音发送（把准备好的音频当 QQ 语音条发出） ──────────────────────────────
@@ -2770,18 +2877,21 @@ async function main() {
   // 发送一个收藏表情（按 emoji_id/url/md5 解析，发图片段）。
   async function sendStickerV2(key, stickerRef, options = {}) {
     const assertSendAllowed = captureSendGuard(key);
-    // 发送前强制同步一次，确保“刚新增的表情能立即用、刚删除的表情不会继续发”。
+    // 先找 QQ 收藏表情（发送前强制同步一次，确保「刚新增的能立即用、刚删除的不会继续发」），
+    // 找不到再找 nekowhale 套组。两者字段不同，下面按 kind 分支处理。
     const synced = await syncStickerLibrary(true);
-    const entry = findSticker(synced?.entries ?? stickerEntries, stickerRef);
-    if (!entry) throw new Error(`找不到表情 ${stickerRef}，请先用 qq_list_stickers 获取有效 id`);
-    const url = entry.url;
-    if (!url) throw new Error(`表情 ${entry.id} 没有可发送的图片地址`);
+    let kindOfSticker = 'qq';
+    let entry = findSticker(synced?.entries ?? stickerEntries, stickerRef);
+    if (!entry) {
+      const meta = await syncNekowhale(false);
+      const nk = meta ? findNekowhale(meta, stickerRef) : null;
+      if (nk) { kindOfSticker = 'nekowhale'; entry = nk; }
+    }
+    if (!entry) throw new Error(`找不到表情 ${stickerRef}，请先用 qq_list_stickers 获取有效 id（QQ 收藏和「大肥鱼」套组都能查到）`);
     const [kind, id] = key.split(':');
     const segments = [];
     const replyToMessageId = options.replyToMessageId;
     const atUserId = options.atUserId;
-    // 仿真常识：一条消息只能是一张表情，不能在同一气泡里附带文字说明。
-    // 想说的话请用 qq_send_message / qq_reply 作为单独气泡发送。
     if (replyToMessageId !== undefined && replyToMessageId !== null && String(replyToMessageId).trim() !== '') {
       const rid = String(replyToMessageId).trim();
       if (!/^-?[1-9]\d*$/.test(rid)) throw new Error('replyToMessageId 必须是非零整数（消息 id 可能为负数）');
@@ -2792,14 +2902,22 @@ async function main() {
       if (!/^\d+$/.test(at)) throw new Error('atUserId 必须是正整数 QQ 号，且不能为 all');
       segments.push({ type: 'at', data: { qq: at } });
     }
+    // 可选的文字段：一条消息里 [reply?, at?, text?, image] 是合法的 OneBot 消息段数组。
+    // （2026-10-31 更正：之前这里写死「不能和文字同气泡、QQ 只允许一条消息一张图」，那是错的。）
+    // 文字走 mdToPlain + splitForQQ 的老路会引入分条逻辑，这里保持简单：单行、限长、不拆条。
+    const textRaw = options.text === undefined || options.text === null ? '' : String(options.text);
+    const textLine = mdToPlain(textRaw).replace(/[\r\n]+/g, ' ').trim().slice(0, 500);
+    if (textLine) segments.push({ type: 'text', data: { text: textLine } });
     // 在桥接内完成带 DNS 固定、逐跳校验和大小限制的下载；不能把 URL 交给网关重新抓取。
     let image;
     try {
       // 表情单独的大小上限（socialV2.sticker.maxBytes，本仓库增强），不用图片识别的 socialV2.media 上限
-      image = await safeFetchBuffer(url, stickerMaxBytes(cfg));
+      image = kindOfSticker === 'nekowhale'
+        // nekowhale：本地有就直接读盘，没有就下载并缓存（首次会慢几百毫秒，之后是本地的）
+        ? await ensureNekowhaleGif(entry, { dir: NEKOWHALE_GIF_DIR, maxBytes: stickerMaxBytes(cfg), fetchBuffer: safeFetchBuffer })
+        : await safeFetchBuffer(entry.url, stickerMaxBytes(cfg));
     } catch (error) {
-      // r4：错误文案改成可定位的说法（多数是 QQ CDN 网络问题或地址失效，不是「地址不合法」）
-      throw new Error(`表情 ${entry.id} 的图片下载失败（QQ CDN 网络异常或地址已失效）：${error?.message ?? error}`);
+      throw new Error(`表情 ${entry.id} 的图片下载失败（CDN 网络异常或地址已失效）：${error?.message ?? error}`);
     }
     segments.push({ type: 'image', data: { file: 'base64://' + image.buffer.toString('base64') } });
     const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg';
@@ -2837,11 +2955,16 @@ async function main() {
       }
     });
     const data = await sendResult;
-    // 更新本地使用统计
+    // 更新本地使用统计。nekowhale 是只读套组，不进 stickers.json（它的 useCount 语义是「QQ 收藏用了几次」），
+    // 只记一次日志方便观察它到底有没有被用起来。
+    if (kindOfSticker === 'nekowhale') {
+      log(`[nekowhale] 已发送 ${describeNekowhale(entry)}`);
+      return { entry, messageId: data?.message_id ?? null, kind: 'nekowhale' };
+    }
     const updated = markStickerUsed(stickerEntries, entry.id, 'sticker');
     stickerEntries = updated.entries;
     saveStickerStoreSafe();
-    return { entry: updated.entry, messageId: data?.message_id ?? null };
+    return { entry: updated.entry, messageId: data?.message_id ?? null, kind: 'qq' };
   }
 
   // 更新本地 AI 认知（含义/标签/用法）。
@@ -6827,7 +6950,10 @@ async function main() {
               enabled: cfg.socialV2?.sticker?.enabled !== false,
               total: stickerEntries.length,
               context: cfg.socialV2?.sticker?.includeInPrompt !== false ? buildStickerContext(stickerEntries, cfg.socialV2?.sticker?.promptMaxStickers ?? 16) : '',
-              strategy: cfg.socialV2?.sticker?.includeInPrompt !== false ? buildStickerStrategyHint() : ''
+              strategy: cfg.socialV2?.sticker?.includeInPrompt !== false ? buildStickerStrategyHint() : '',
+              nekowhale: nekowhaleMeta
+                ? { pack: nekowhaleMeta.pack, total: nekowhaleMeta.stickers.length, context: buildNekowhaleContext(nekowhaleMeta) }
+                : { pack: null, total: 0, context: '' }
             },
             // 语音库摘要：让 AI 一开始就知道有哪些语音可发（真发之前用 qq_list_voices 看详情）。
             voices: cfg.socialV2?.voice?.enabled === false ? { enabled: false } : {
@@ -7634,26 +7760,32 @@ async function main() {
           if (req.headers['x-agent-token'] && !v2ToolEnabled('getStickerImage')) { sendJson({ ok: false, error: '工具未启用：qq_get_sticker_image' }, 403); return; }
           if (req.headers['x-agent-token'] && !modelCanSeeImages()) { sendJson({ ok: false, error: `当前模型 ${currentModelLabel()} 不能看图，表情图片不返回；请按表情的备注和标签使用` }, 409); return; }
           try {
-            const entry = await getStickerImageData(stickerId);
-            const fetched = await safeFetchBuffer(entry.url, MAX_MEDIA_BYTES);
-            const dims = getImageDimensions(fetched.buffer);
+            const found = await getStickerImageData(stickerId);
+            const entry = found.entry;
+            // nekowhale 条目走本地缓存优先（懒加载），QQ 收藏照旧直接抓 CDN。
+            const buffer = found.kind === 'nekowhale'
+              ? (await ensureNekowhaleGif(entry, { dir: NEKOWHALE_GIF_DIR, maxBytes: stickerMaxBytes(cfg), fetchBuffer: safeFetchBuffer })).buffer
+              : (await safeFetchBuffer(entry.url, MAX_MEDIA_BYTES)).buffer;
+            const dims = getImageDimensions(buffer);
             if (dims && dims.width * dims.height > MAX_MEDIA_PIXELS) {
               sendJson({ ok: false, error: `表情图片像素超限（${dims.width}x${dims.height}），已拒绝` }, 400);
               return;
             }
-            const mimeType = mimeFromBuffer(fetched.buffer) || mimeFromUrl(entry.url);
+            const mimeType = mimeFromBuffer(buffer) || mimeFromUrl(entry.url);
             sendJson({
               ok: true,
               key,
               sticker: {
                 id: entry.id,
                 desc: entry.desc || '',
-                localNote: entry.localNote || '',
+                localNote: entry.localNote || entry.use || '',
                 tags: entry.tags || [],
                 url: entry.url,
-                md5: entry.md5
+                md5: entry.md5,
+                kind: found.kind,
+                emotion: entry.emotion || ''
               },
-              image: { mimeType, data: fetched.buffer.toString('base64') }
+              image: { mimeType, data: buffer.toString('base64') }
             });
           } catch (error) {
             sendJson({ ok: false, error: `获取表情图片失败：${error?.message ?? error}` }, 500);
@@ -8334,13 +8466,14 @@ async function main() {
           const body = await readBody();
           const key = String(body.key ?? '').trim();
           const stickerId = String(body.stickerId ?? '').trim();
-          const caption = String(body.message ?? body.caption ?? '').trim();
+          const caption = String(body.message ?? body.caption ?? body.text ?? '').trim();
           const replyToMessageId = body.replyToMessageId;
           const atUserId = body.atUserId ?? null;
           if (!key || !stickerId) { sendJson({ ok: false, error: 'key 和 stickerId 不能为空' }, 400); return; }
-          // 仿真常识：表情消息只能是一张表情，不能在同一气泡里附带文字说明。
-          if (caption) {
-            sendJson({ ok: false, error: '表情消息不能附带文字；请先用 qq_send_message / qq_reply 把想说的话作为单独气泡发送，再单独 qq_send_sticker 发表情' }, 400);
+          // caption 是可选文字段：一条消息里 [reply?, at?, text?, image] 是合法的 OneBot 消息段数组，
+          // 字和图在同一个气泡里没问题。走敏感词审计，与文本发送口径一致。
+          if (caption && SENSITIVE_RE.test(caption)) {
+            sendJson({ ok: false, error: '文字部分命中敏感词，已拦截' }, 400);
             return;
           }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
@@ -8390,11 +8523,12 @@ async function main() {
             if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
             const sent = await sendStickerV2(key, stickerId, {
               replyToMessageId: actualReplyToMessageId,
-              atUserId
+              atUserId,
+              text: caption
             });
             // 记录到二代会话的 recentMessages，让 AI 知道自己发过这个表情
-            const label = sent.entry?.desc || sent.entry?.localNote || '表情包';
-            const text = `[表情包:${label}]`;
+            const label = sent.entry?.desc || sent.entry?.localNote || sent.entry?.use || sent.entry?.name || '表情包';
+            const text = caption ? `${caption} [表情包:${label}]` : `[表情包:${label}]`;
             st.recentMessages.push({
               messageId: sent.messageId ? String(sent.messageId) : null,
               sender: '我',
@@ -10934,12 +11068,30 @@ async function main() {
     return out;
   }
 
-  function mediaHintFor(key, messageRef, mediaList) {
-    if (!Array.isArray(mediaList) || mediaList.length === 0 || !messageRef) return '';
-    if (currentMode === 'reserved2') {
-      return `\n【图片/表情】本条消息包含 ${mediaList.length} 个图片/表情（消息ID=${messageRef}）。如需要查看/识别，请调用 mcp__snowluma__qq_get_message_images，参数 key="${key}", messageId="${messageRef}"。`;
+  function mediaHintFor(key, messageRef, mediaList, quoted = null) {
+    const ownCount = Array.isArray(mediaList) ? mediaList.length : 0;
+    const quoteList = Array.isArray(quoted) ? quoted : (Array.isArray(quoted?.media) ? quoted.media : []);
+    const quoteCount = quoteList.length;
+    if (ownCount === 0 && quoteCount === 0) return '';
+    const lines = [];
+    if (ownCount > 0 && messageRef) {
+      if (currentMode === 'reserved2') {
+        lines.push(`【图片/表情】本条消息包含 ${ownCount} 个图片/表情（消息ID=${messageRef}）。如需要查看/识别，请调用 mcp__snowluma__qq_get_message_images，参数 key="${key}", messageId="${messageRef}"。`);
+      } else {
+        lines.push(`【图片/表情】本条消息包含 ${ownCount} 个图片/表情（消息ID=${messageRef}）。`);
+      }
     }
-    return `\n【图片/表情】本条消息包含 ${mediaList.length} 个图片/表情（消息ID=${messageRef}）。`;
+    // 被引用的消息里带了图：以前这里什么都不说，模型只会回「你引用的图我看不到」。
+    // 现在明确告诉它「引用里还有 N 张」，并给出那条消息自己的 ID 便于单独取图。
+    if (quoteCount > 0) {
+      const quotedId = quoted?.messageId ? String(quoted.messageId) : '';
+      if (currentMode === 'reserved2' && quotedId) {
+        lines.push(`【引用的消息里有 ${quoteCount} 个图片/表情（消息ID=${quotedId}）】如果这些图和你正在回的内容有关，调用 mcp__snowluma__qq_get_message_images，参数 key="${key}", messageId="${quotedId}"；无关就别去翻。`);
+      } else {
+        lines.push(`【引用的消息里有 ${quoteCount} 个图片/表情】`);
+      }
+    }
+    return `\n${lines.join('\n')}`;
   }
 
   function findMessageMedia(key, ref) {
@@ -12992,6 +13144,10 @@ async function main() {
         resolveRecord: makeRecordResolver(raw.message_id ?? raw.msg_id)
       });
       const senderUserId = raw.sender?.user_id ?? raw.user_id ?? null;
+      // 被引用消息里的媒体（图片/表情/语音/视频）。以前只取文字，导致「引用一张图 + 一句话」
+      // 这种高频场景里模型完全看不到图，只能回一句「图我没看到」。这里把媒体元数据也带上，
+      // 由调用方决定要不要合并进 mediaList 一起下载。
+      const quotedMedia = extractMediaFromSegments(raw.message ?? []);
       // 被引用消息里的合并转发 id：归属已在上面校验过（同群 / 同一私聊），登记为本会话可见，
       // 这样 AI 看到「[引用 某人：[转发消息 id=…]]」后能直接用 qq_get_forward_msg 打开（哪怕原转发早已滚出最近消息）。
       const forwardIds = extractForwardIds(raw.message ?? []).map(sanitizeForwardId).filter(Boolean);
@@ -13000,7 +13156,9 @@ async function main() {
         sender: String(sender ?? ''),
         text: String(text ?? '').slice(0, 200),
         userId: senderUserId != null ? String(senderUserId) : null,
-        forwardIds
+        forwardIds,
+        media: quotedMedia,
+        quotedMessageId: raw.message_id != null ? String(raw.message_id) : String(messageId)
       };
       replyInfoCache.set(cacheKey, { info, ts: Date.now() });
       return info;
@@ -13548,8 +13706,14 @@ async function main() {
     const participationLine = participationText ? `${participationText}\n\n` : '';
     const antiAiLine = '【反AI味】你不是客服：不用有求必应，可以装傻、已读乱回、拒绝推荐；少用“一绝/真管用/保证/绝对”这类词。\n\n';
     const stickerCfg = cfg.socialV2?.sticker ?? {};
+    // 两套表情各自成段：QQ 收藏（有 AI 认知、按 useCount 排）+「大肥鱼」套组（按情绪分类的目录）。
+    // nekowhale 段是「索引」不是全集：24 个情绪每人 1-2 张代表，想找更贴的让 AI 用 qq_list_stickers 搜。
+    const nkContext = nekowhaleMeta ? buildNekowhaleContext(nekowhaleMeta) : '';
+    // 首次运行（还没有本地缓存、后台预热也没跑完）时不要让这段永远为空：
+    // 这里只触发一次拉取，不等它——本条 prompt 没有套组也不影响聊天，下一次就有了。
+    if (!nekowhaleMeta && stickerCfg.enabled !== false) syncNekowhale(false).catch(() => {});
     const stickerLine = stickerCfg.enabled !== false && stickerCfg.includeInPrompt !== false
-      ? `${buildStickerStrategyHint()}\n${buildStickerContext(stickerEntries, stickerCfg.promptMaxStickers ?? 16)}\n\n`
+      ? `${buildStickerStrategyHint()}\n${buildStickerContext(stickerEntries, stickerCfg.promptMaxStickers ?? 16)}\n${nkContext ? `${nkContext}\n` : ''}\n`
       : '';
     const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
     const proactiveLine = '【积极性】不要习惯性潜水：群里有你能接的话题就主动参与，偶尔插一句别人的话题也很正常；只有确实没话可说、对方已明确结束、或长时间没人说话时才潜水。\n\n';
@@ -14244,17 +14408,36 @@ async function main() {
     const recordResolver = makeRecordResolver(event.message_id ?? event.msg_id ?? event.message_seq);
     const textContent = await segmentsToText(event.message ?? [], { resolveAtName, resolveReply, resolveRecord: recordResolver });
     const plainContent = await segmentsToText(event.message ?? [], { resolveAtName, includeReply: false, resolveRecord: recordResolver });
-    const mediaList = extractMediaFromSegments(event.message ?? []);
+    const ownMedia = extractMediaFromSegments(event.message ?? []);
+    // 引用段：把被引用消息里的图片/表情也并进来。QQ 里「引用一张图 + 一句评论」是高频场景，
+    // 只给模型看文字的话它只能回「图我没看到」。这里合并成一份 mediaList 一起下载内联；
+    // 引用图排在后面，这样 [图片N] 的编号和「本条消息自己的图」顺序一致、不会错位。
+    let quotedMedia = [];
+    let quotedRef = null;
+    for (const seg of Array.isArray(event.message) ? event.message : []) {
+      if (seg?.type !== 'reply') continue;
+      const rid = String(seg?.data?.id ?? '').trim();
+      if (!rid) continue;
+      const info = await resolveReply(rid);
+      if (Array.isArray(info?.media) && info.media.length) {
+        quotedMedia = info.media;
+        quotedRef = { messageId: info.quotedMessageId ?? rid, sender: info.sender ?? '' };
+      }
+      break;
+    }
+    const mediaList = quotedMedia.length ? [...ownMedia, ...quotedMedia] : ownMedia;
     const messageRef = String(event.message_id ?? event.msg_id ?? event.message_seq ?? '');
     const seqRef = event.message_seq != null ? String(event.message_seq) : '';
     const refsToStore = [...new Set([messageRef, seqRef].filter(Boolean))];
-    if (refsToStore.length > 0 && mediaList.length > 0) {
+    // 注意这里存的是 ownMedia 而不是合并后的 mediaList：messageMediaStore 的语义是
+    // 「这条消息自己的图」，qq_get_message_images(messageId=本条) 不该把被引用的图也算进来。
+    if (refsToStore.length > 0 && ownMedia.length > 0) {
       let mediaByRef = messageMediaStore.get(key);
       if (!mediaByRef) {
         mediaByRef = new Map();
         messageMediaStore.set(key, mediaByRef);
       }
-      for (const ref of refsToStore) mediaByRef.set(ref, mediaList);
+      for (const ref of refsToStore) mediaByRef.set(ref, ownMedia);
       // 防止无限增长：超过上限时删除最旧一条（Map 保持插入序）
       while (mediaByRef.size > MAX_MEDIA_STORE_PER_KEY) {
         const oldestKey = mediaByRef.keys().next().value;
@@ -14514,7 +14697,7 @@ async function main() {
       + (kind === 'group'
         ? `${event.sender?.card || event.sender?.nickname || String(event.user_id)}：${textContent}`
         : textContent)
-      + mediaHintFor(key, messageRef, mediaList);
+      + mediaHintFor(key, messageRef, ownMedia, quotedRef ? { media: quotedMedia, messageId: quotedRef.messageId } : null);
 
     appendActivity(`${key} ${isOwner ? '管理员' : '群友'} ${event.sender?.nickname || event.user_id}：${textContent.slice(0, 80)}`);
 
@@ -14545,7 +14728,7 @@ async function main() {
         st.probeDeadline = 0;
         // 私聊：发给你就是叫你，直接即时投递，不等轮询、不参与沉默
         if (kind === 'private') {
-          const promptText = `${roleHint ? roleHint + '\n\n' : ''}${isOwner ? '【管理员】' : ''}${textContent}${mediaHintFor(key, messageRef, mediaList)}`;
+          const promptText = `${roleHint ? roleHint + '\n\n' : ''}${isOwner ? '【管理员】' : ''}${textContent}${mediaHintFor(key, messageRef, ownMedia, quotedRef ? { media: quotedMedia, messageId: quotedRef.messageId } : null)}`;
           scheduleSocialReply(
             key, promptText,
             Number(cfg.social?.activeReplyDelayMinMs ?? 2000),
@@ -14579,7 +14762,7 @@ async function main() {
       const replyInstruction = direct
         ? `请回复消息。\n${directionHint}${SPACE_SPLIT_HINT}`
         : `请根据情况决定是否回复。如果不需要回应、想潜水/不接话，请只输出 ${SILENT_MARKER}；否则正常回复。\n${directionHint}${SPACE_SPLIT_HINT}`;
-      const promptText = `${roleHint ? roleHint + '\n\n' : ''}【群聊上下文】\n${buildContextBlock(key)}\n【当前消息】${currentLine}${mediaHintFor(key, messageRef, mediaList)}\n\n${replyInstruction}`;
+      const promptText = `${roleHint ? roleHint + '\n\n' : ''}【群聊上下文】\n${buildContextBlock(key)}\n【当前消息】${currentLine}${mediaHintFor(key, messageRef, ownMedia, quotedRef ? { media: quotedMedia, messageId: quotedRef.messageId } : null)}\n\n${replyInstruction}`;
       if (isOwner && kind === 'private') {
         log(`社交模式：管理员私聊触发，立即投递 ${key}`);
         await deliverPrompt(key, promptText, { media: mediaList });

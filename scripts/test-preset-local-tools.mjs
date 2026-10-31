@@ -163,6 +163,11 @@ const NOT_REGISTERED_HERE_TOOL_NAMES = new Set([
   'team_task_get',
   'team_task_list',
   'team_task_update',
+  // 2026-10-31：dsh-video-storyboard 0.5.4 的 src/storyboard/register.js 里
+  // `subtitlesToolSpec()` 是第五个工具（源码确证），但当前运行中的 DSH 进程
+  // 热加载到的是先装的 0.4.5（那版没有这个工具），会话缓存里因此没有它的真名。
+  // 重启 DSH 后它就会出现；守卫名单必须继续写它，否则新版本一上来就漏隐藏。
+  'video_subtitles',
 ]);
 /** 允许出现在名单里、但不属于"本地执行"语义的名字（开发/注入器）。 */
 const DEV_TOOL_PREFIX = /^dev_/;

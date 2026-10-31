@@ -1301,11 +1301,11 @@ if (cfg.socialV2?.tools?.getImages !== false) {
 if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.listStickers !== false) {
   server.tool(
     'qq_list_stickers',
-    '查看 QQ 账号上已收藏的表情包（自定义表情）列表：包含 emoji_id、备注 desc、本地笔记 localNote、标签 tags、使用次数等。可通过 query 按备注/笔记/标签搜索；无备注的表情可以先调用 qq_get_sticker_image 看图理解，再用 qq_sticker_note 记下含义。刚新增/删除表情后如需立即同步，请传 refresh=true。',
+    '查看可用表情包：QQ 账号已收藏的自定义表情（含备注 desc、本地笔记 localNote、标签 tags、使用次数），以及「大肥鱼」表情套组的索引（按情绪分类）。可通过 query 搜索：既能按备注/笔记/标签/情绪搜，例如 query="开心"、"嘲讽"、"晚安"；无备注的表情可以先调用 qq_get_sticker_image 看图理解，再用 qq_sticker_note 记下含义。刚新增/删除表情后如需立即同步，请传 refresh=true。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
-      query: z.string().optional().describe('可选搜索词，按备注/本地笔记/标签/用法过滤'),
+      query: z.string().optional().describe('可选搜索词：按备注/本地笔记/标签/用法/情绪过滤（QQ 收藏与「大肥鱼」套组都会搜）'),
       count: z.number().optional().describe('最多返回条数，默认 48，受 socialV2.sticker.maxListCount 配置上限约束（当前通常 100）'),
       refresh: z.boolean().optional().describe('是否强制从 QQ 重新同步收藏表情，默认 false（走缓存）')
     },
@@ -1358,19 +1358,20 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.getStickerI
 if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.sendSticker !== false) {
   server.tool(
     'qq_send_sticker',
-    '在指定会话发送一个 QQ 收藏表情包（自定义表情）。stickerId 用 qq_list_stickers 返回的 id / md5 / url。注意：一条消息只能是一张表情，不能在同一气泡里附带文字；想说的话请先用 qq_send_message / qq_reply 作为单独气泡发送，再单独发这张表情。需要引用/点名时可用 replyToMessageId / atUserId（群聊）。真人偶尔用表情包很自然，但别刷屏。',
+    '在指定会话发送一个表情包。stickerId 可以是 QQ 收藏表情的 id / md5 / url，也可以是「大肥鱼」套组的 id（如「大肥鱼/10N01_猫猫搓手」）、编号（10N01）或中文短名（猫猫搓手）。可选 text：传了就在同一条消息里先发这句话、再跟这张图（一条消息里同时有文字和图片是合法的）；不传就是纯表情。需要引用/点名时可用 replyToMessageId / atUserId（群聊）。真人偶尔用表情包很自然，但别刷屏。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
-      stickerId: z.string().describe('表情标识：emoji_id / md5 / 图片 URL（来自 qq_list_stickers）'),
+      stickerId: z.string().describe('表情标识：QQ 收藏的 emoji_id / md5 / 图片 URL，或「大肥鱼」套组的 id / 编号 / 中文短名（来自 qq_list_stickers）'),
+      text: z.string().optional().describe('可选：配在这张表情前面的文字，会在同一条消息里先文字后图片。不传就是纯表情'),
       replyToMessageId: z.union([z.number(), z.string()]).optional().describe('要引用/回复的消息 id（非零整数，可为负数，可选）'),
       atUserId: z.union([z.number(), z.string()]).optional().describe('要 @ 的群成员 QQ 号（群聊中可选，私聊不可用）')
     },
-    async ({ key, token, stickerId, replyToMessageId, atUserId }) => {
+    async ({ key, token, stickerId, text, replyToMessageId, atUserId }) => {
       try {
         const data = await agentApi('/api/socialV2/send-sticker', {
           method: 'POST',
-          body: JSON.stringify({ key, stickerId: String(stickerId), replyToMessageId, atUserId: atUserId ?? null }),
+          body: JSON.stringify({ key, stickerId: String(stickerId), text: text ?? null, replyToMessageId, atUserId: atUserId ?? null }),
           headers: { 'x-agent-token': token },
           timeoutMs: 300000
         });

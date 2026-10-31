@@ -182,6 +182,14 @@ const REQUEST_TIMEOUT_MS = 20000;
 // 把整个 20 秒总预算耗光。
 const ATTEMPT_TIMEOUT_MS = 8000;
 const MAX_ADDRESS_ATTEMPTS = 4;
+// 二进制（图片/音频下载）单独一套预算。原因见文件末尾注释：
+// 8 秒的「整段下载」预算对几 MB 的图片是不够的——实测 1.9MB GIF 走 safeFetchBuffer
+// 要 4 秒，QQ 图片 CDN 更慢，于是每次都在传到一半时被判超时、换地址重头再来，
+// 4 个地址耗光 20 秒总预算后报「请求超时」。改成「空闲超时」语义后，
+// 只要还在持续收数据就不会被打断，只有真的卡住不动才切换地址。
+const BINARY_ATTEMPT_TIMEOUT_MS = 15000;
+const BINARY_REQUEST_TIMEOUT_MS = 60000;
+const BINARY_MAX_ADDRESS_ATTEMPTS = 6;
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
 function validateLimit(value, name) {
@@ -192,26 +200,51 @@ function validateLimit(value, name) {
  * 用**一个**已校验的地址发起一次尝试，保留原始 Host/SNI（禁止重新解析 DNS）。
  * 返回 `{ok:true,result}` 或 `{ok:false,error,retryable}`；retryable 只标记网络层失败
  * （连接失败/超时/正文中断），大小与图片签名等策略性拒绝不重试。
+ *
+ * binary 模式下 budgetMs 是**空闲超时**：每收到一段数据就重置计时器，只有连续
+ * budgetMs 毫秒没有任何字节到达才算超时；同时 deadlineMs 给整段下载兜一个绝对上限。
  */
-function attemptOnce(url, address, limit, binary, budgetMs) {
+function attemptOnce(url, address, limit, binary, budgetMs, hardBudgetMs = 0) {
   return new Promise((resolve) => {
     let settled = false;
     let req;
     let response;
+    let timer = null;
+    let hardTimer = null;
     const settle = (outcome) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
+      if (hardTimer) clearTimeout(hardTimer);
       resolve(outcome);
     };
     const fail = (error, retryable) => settle({ ok: false, error, retryable: retryable === true });
     const done = (result) => settle({ ok: true, result });
-    const timer = setTimeout(() => {
-      const error = new Error(`请求超时：${url.hostname}`);
-      fail(error, true);
-      req?.destroy(error);
-      response?.destroy();
-    }, budgetMs);
+    // 每次调用都重新计时：binary 下由 data 事件反复调用，实现「空闲超时」。
+    //
+    // 这里刻意**不用 Date.now() 算 deadline**：绝对上限必须自己就是一个 setTimeout，
+    // 否则会被「时钟」与「定时器」分离的环境骗过（测试里 mock 了 setTimeout 而墙钟不动，
+    // 依赖 Date.now 的上限就永远不会到，等于没有上限）。独立的一次性 hardTimer 才是
+    // 「不管数据怎么来都一定收尾」的那个保证。
+    const armTimer = () => {
+      if (settled) return;
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        const error = new Error(`请求超时：${url.hostname}`);
+        fail(error, true);
+        req?.destroy(error);
+        response?.destroy();
+      }, budgetMs);
+    };
+    if (hardBudgetMs > 0) {
+      hardTimer = setTimeout(() => {
+        const error = new Error(`请求超时：${url.hostname}`);
+        fail(error, true);
+        req?.destroy(error);
+        response?.destroy();
+      }, hardBudgetMs);
+    }
+    armTimer();
     const mod = url.protocol === 'https:' ? https : http;
     const hostname = url.hostname.replace(/^\[|\]$/g, '');
     try {
@@ -260,6 +293,8 @@ function attemptOnce(url, address, limit, binary, budgetMs) {
         res.on('data', (chunk) => {
           if (settled) return;
           if (!binary) { appendText(decoder.write(chunk)); return; }
+          // 收到数据 = 连接还活着，把空闲计时器往后推（关键：大图不再被 8 秒硬砍）
+          armTimer();
           size += chunk.length;
           if (size > limit) {
             fail(new Error(`图片超过大小限制（${limit} 字节）`), false);
@@ -303,16 +338,21 @@ function attemptOnce(url, address, limit, binary, budgetMs) {
 async function requestOnce(url, addresses, limit, binary = false) {
   const list = (Array.isArray(addresses) ? addresses : [addresses]).filter(Boolean);
   if (!list.length) throw new Error(`没有可用地址：${url.hostname}`);
-  const deadline = Date.now() + REQUEST_TIMEOUT_MS;
+  // 二进制走自己一套更宽的预算，且是「空闲超时」语义（见 BINARY_* 常量说明）。
+  const totalBudget = binary ? BINARY_REQUEST_TIMEOUT_MS : REQUEST_TIMEOUT_MS;
+  const attemptBudget = binary ? BINARY_ATTEMPT_TIMEOUT_MS : ATTEMPT_TIMEOUT_MS;
+  const maxAttempts = binary ? BINARY_MAX_ADDRESS_ATTEMPTS : MAX_ADDRESS_ATTEMPTS;
+  const deadline = Date.now() + totalBudget;
   let lastError = null;
-  const attempts = Math.min(list.length, MAX_ADDRESS_ATTEMPTS);
+  const attempts = Math.min(list.length, maxAttempts);
   for (let i = 0; i < attempts; i += 1) {
     const remaining = deadline - Date.now();
     if (remaining <= 250) break;
     const budget = list.length === 1
-      ? REQUEST_TIMEOUT_MS
-      : Math.min(ATTEMPT_TIMEOUT_MS, remaining);
-    const outcome = await attemptOnce(url, list[i], limit, binary, budget);
+      ? totalBudget
+      : Math.min(attemptBudget, remaining);
+    // 二进制额外挂一个「绝对总上限」的独立计时器：不管数据是否一直在来，到点就收尾。
+    const outcome = await attemptOnce(url, list[i], limit, binary, budget, binary ? totalBudget : 0);
     if (outcome.ok) return outcome.result;
     lastError = outcome.error;
     if (!outcome.retryable) throw outcome.error;

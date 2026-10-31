@@ -32,7 +32,10 @@ test('桥接接线：发送与收藏表情用表情上限；图片识别与 qq_g
   const src = fs.readFileSync(path.join(root, 'src', 'bridge.js'), 'utf8');
   assert.match(src, /const MAX_MEDIA_BYTES = maxMediaBytesLimit;/, '图片识别上限来自 socialV2.media.maxBytes（r4）');
   assert.match(src, /cfg\.socialV2\?\.media\?\.maxBytes[\s\S]{0,200}: 8 \* 1024 \* 1024/, '图片识别默认 8MB（r4）');
-  assert.match(src, /image = await safeFetchBuffer\(url, stickerMaxBytes\(cfg\)\);/, '发送收藏表情用表情上限');
+  // 2026-10-31：发送表情改成双源（QQ 收藏 / nekowhale 套组），改用三元表达式，
+  // 原来的单行 `image = await safeFetchBuffer(url, ...)` 不再存在。断言改成钉住两支各自的上限。
+  assert.match(src, /: await safeFetchBuffer\(entry\.url, stickerMaxBytes\(cfg\)\);/, '发送收藏表情用表情上限');
+  assert.match(src, /ensureNekowhaleGif\(entry, \{ dir: NEKOWHALE_GIF_DIR, maxBytes: stickerMaxBytes\(cfg\)/, '发送 nekowhale 表情同样用表情上限');
   assert.match(src, /fetchOneBotImage\(media, \{ maxBytes: stickerMaxBytes\(cfg\) \}\)/, '收藏图片表情用表情上限');
   assert.match(src, /fetchFaceMedia\(media, \{ maxBytes: stickerMaxBytes\(cfg\) \}\)/, '收藏 QQ 表情用表情上限');
   assert.match(src, /async function fetchOneBotImage\(media, \{ maxBytes = MAX_MEDIA_BYTES \} = \{\}\)/, '默认仍是图片识别上限');

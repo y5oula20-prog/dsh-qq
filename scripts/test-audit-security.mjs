@@ -171,11 +171,25 @@ test('text and image requests have a total deadline despite continuous incoming 
   for (const fetcher of [safeFetch, safeFetchBuffer]) {
     const pending = fetcher('http://93.184.216.34/');
     const rejected = assert.rejects(pending, /请求超时/);
+    // 单独挂一个 catch 观察「已经失败」，避免 assert.rejects 还没执行就提前跳出循环。
+    let errored = false;
+    pending.catch(() => { errored = true; });
     // Let URL validation and the mocked response callback complete.
     for (let i = 0; i < 8; i++) await Promise.resolve();
-    t.mock.timers.tick(19000);
-    responses.at(-1).write(Buffer.from('a'));
-    t.mock.timers.tick(1000);
+
+    // 关键语义：**不管数据是不是一直在来**，都必须有一个绝对总超时收尾，否则慢速滴灌
+    // 可以无限期占住连接。这里不写死具体秒数——文本 20 秒、二进制 60 秒是两套不同预算
+    // （见 safe-fetch.js 的 BINARY_* 常量），写死秒数会把「调预算」误判成「破坏不变量」。
+    // 改成每 1 秒推进一次并写一个字节（模拟数据持续到达），断言它终究超时且不超天花板。
+    const HARD_CEILING_MS = 180000;
+    let elapsed = 0;
+    while (!errored && elapsed < HARD_CEILING_MS) {
+      t.mock.timers.tick(1000);
+      elapsed += 1000;
+      responses.at(-1).write(Buffer.from('a'));
+      await Promise.resolve();
+    }
+    assert.ok(elapsed < HARD_CEILING_MS, `${fetcher.name}: 数据持续到达时也必须有一个总超时，不能无限期挂着`);
     await rejected;
     assert.equal(requests.at(-1).req.destroyed, true);
     assert.equal(responses.at(-1).destroyed, true);
