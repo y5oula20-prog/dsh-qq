@@ -375,6 +375,8 @@ const TOOL_CONFIG_FLAGS = {
   qq_ignore_clear: 'ignorePerson',
   // 告状通道：她被欺负时 @ 柚宝诉苦（单向只发给 owner 私聊）
   qq_tell_owner: 'tellOwner',
+  // 人设翻译器：柚宝私聊加设定，两段式预览后落盘
+  qq_persona_edit: 'personaEdit',
 };
 const disabledTools = [];
 {
@@ -1184,6 +1186,29 @@ server.tool(
       return { content: [{ type: 'text', text: serializeModelData(data) }] };
     } catch (error) {
       return { content: [{ type: 'text', text: `告状发送失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_persona_edit',
+  '柚宝在私聊给你加设定时用的落盘工具。两段式：先用 action=preview 把翻译好的设定预览给柚宝看，等他明确确认后，再用完全一致的 text 调 action=commit 才会写进人格卡。没确认之前不要 commit。',
+  {
+    key: z.string().describe('会话 key，必须是 private:<ownerQQ>'),
+    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    action: z.enum(['preview', 'commit']).describe('preview=只预览不落盘；commit=确认后落盘'),
+    text: z.string().describe('翻译成你自己口吻的设定，一句话')
+  },
+  async ({ key, token, action, text }) => {
+    try {
+      const data = await agentApi('/api/socialV2/persona-edit', {
+        method: 'POST',
+        body: JSON.stringify({ key, action, text }),
+        headers: { 'x-agent-token': token }
+      });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `人设修改失败：${error?.message ?? error}` }], isError: true };
     }
   }
 );

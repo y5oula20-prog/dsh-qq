@@ -1041,6 +1041,8 @@ function loadConfig() {
     ignorePerson: true,
     // 告状通道：她可以 @ 柚宝诉苦（单向只发给 owner 私聊，不会回群）
     tellOwner: true,
+    // 人设翻译器：柚宝在私聊加设定，小柚翻译成自己的口吻先预览，柚宝确认后才写进人格卡
+    personaEdit: true,
     // 表情回应（NapCat set_msg_emoji_like）：给消息贴 QQ 系统表情
     emojiLike: true,
     ...(cfg.socialV2.tools ?? {})
@@ -1129,6 +1131,16 @@ function loadConfig() {
     reminderTime: '21:30',
     maxChars: 2000,
     ...((cfg.socialV2?.diary && typeof cfg.socialV2.diary === 'object' && !Array.isArray(cfg.socialV2.diary)) ? cfg.socialV2.diary : {})
+  };
+
+  // socialV2.personaEdit：人设翻译器。柚宝在私聊对小柚说「加设定」，小柚翻译成自己的口吻
+  // 先预览、等柚宝确认后才写进 roles/<当前角色>.md 的「# 柚宝补充」区块。两道锁：
+  // ① 只认 private:<ownerQQ> + agent token；② 两段式 preview → commit（文本一致 + TTL 内）。
+  cfg.socialV2.personaEdit = {
+    enabled: true,
+    maxChars: 400,
+    previewTtlMs: 10 * 60 * 1000,
+    ...((cfg.socialV2?.personaEdit && typeof cfg.socialV2.personaEdit === 'object' && !Array.isArray(cfg.socialV2.personaEdit)) ? cfg.socialV2.personaEdit : {})
   };
 
   // socialV2.initialPromptMaxChars：会话「初始提示词」的字数上限。config.json 是用户可编辑的，
@@ -3503,6 +3515,50 @@ async function main() {
     }
     return { allowed: true };
   }
+  // ── 人设翻译器（reserved2）：柚宝在私聊加设定，两段式 preview → commit ──────────
+  // 锁① 只认 private:<ownerQQ> + agent token；锁② 文本一致 + TTL 内才落盘。
+  const personaPreviews = new Map(); // owner key -> { text, ts }：待确认预览（内存态，每 owner 单槽）
+  function personaEditAllowed(key) {
+    if (cfg.socialV2?.personaEdit?.enabled === false) return { allowed: false, reason: '人设翻译器未开启' };
+    const canonical = canonicalV2Key(key);
+    if (!canonical) return { allowed: false, reason: '无效的会话 key' };
+    if (canonical !== `private:${String(cfg.ownerQQ ?? '')}`) {
+      return { allowed: false, reason: '只有柚宝的私聊才能改人设' };
+    }
+    return { allowed: true };
+  }
+  function personaTargetRole() {
+    const st = readRoleState();
+    const raw = st?.role || '小柚';
+    return sanitizeRoleName(raw) || '小柚';
+  }
+  function appendPersonaSupplement(name, text) {
+    const file = roleFilePath(name);
+    const current = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+    const marker = '# 柚宝补充';
+    const entry = `- ${text}`;
+    if (current.includes(entry)) return { written: false, alreadyExists: true };
+    const idx = current.indexOf(marker);
+    let next;
+    if (idx >= 0) {
+      const after = current.slice(idx + marker.length);
+      const nextHeader = after.indexOf('\n# ');
+      const insertAt = nextHeader >= 0 ? idx + marker.length + nextHeader : current.length;
+      const head = current.slice(0, insertAt).replace(/\n+$/, '');
+      const tail = nextHeader >= 0 ? current.slice(insertAt) : '';
+      next = head + '\n' + entry + '\n' + tail;
+    } else {
+      next = (current ? current.replace(/\n+$/, '') + '\n\n' : '') + marker + '\n' + entry + '\n';
+    }
+    if (Buffer.byteLength(next, 'utf8') > ROLE_CONTENT_MAX_BYTES) {
+      throw new Error(`人格卡已接近上限，这条补充写不进去了`);
+    }
+    const bak = `${file}.bak-${Date.now()}`;
+    try { fs.copyFileSync(file, bak); } catch {}
+    writeRoleContent(name, next);
+    return { written: true, alreadyExists: false, backup: path.basename(bak) };
+  }
+
   // 成长笔记配额：单独落盘 state/growth-quota.json（结构 { "YYYY-MM-DD": { "<key>": n } }）。
   // 不塞进 social-v2.json，因为 saveSocialV2State() 只序列化白名单字段，塞进去重启即丢。
   function growthQuotaLoad() {
@@ -9717,6 +9773,41 @@ async function main() {
           log(`[reserved2] 告状已发 owner (${where})：${message.slice(0, 80)}`);
           appendActivity(`${key} [reserved2] 告状已发 owner：${message.slice(0, 80)}`);
           sendJson({ ok: true, key, delivered: true });
+          return;
+        }
+        // ── 人设翻译器（reserved2）：柚宝在私聊加设定，两段式 preview → commit ───
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/persona-edit') {
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          const action = String(body.action ?? 'preview').trim();
+          const rawText = String(body.text ?? '').trim();
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+          if (!rawText) { sendJson({ ok: false, error: 'text 不能为空' }, 400); return; }
+          if (!['preview', 'commit'].includes(action)) { sendJson({ ok: false, error: 'action 只能是 preview 或 commit' }, 400); return; }
+          if (!req.headers['x-agent-token']) { sendJson({ ok: false, error: '缺少 agent token' }, 403); return; }
+          if (!agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (!v2ToolEnabled('personaEdit')) { sendJson({ ok: false, error: '工具未启用：qq_persona_edit' }, 403); return; }
+          const allow = personaEditAllowed(key);
+          if (!allow.allowed) { sendJson({ ok: false, error: allow.reason || '人设修改被拒绝' }, 403); return; }
+          const maxChars = Math.max(1, Number(cfg.socialV2?.personaEdit?.maxChars) || 400);
+          const text = truncateText(rawText, maxChars);
+          if (action === 'preview') {
+            personaPreviews.set(key, { text, ts: Date.now() });
+            sendJson({ ok: true, key, action: 'preview', preview: text, note: '还没写盘。让柚宝在私聊确认「确认」后，再调一次 action=commit 且 text 完全一致才会落盘。' });
+            return;
+          }
+          // action === 'commit'
+          const pending = personaPreviews.get(key);
+          const ttl = Math.max(1000, Number(cfg.socialV2?.personaEdit?.previewTtlMs) || 10 * 60 * 1000);
+          if (!pending || pending.text !== text) { sendJson({ ok: false, error: '先预览，等柚宝确认后再用完全一致的文本落盘' }, 409); return; }
+          if (Date.now() - pending.ts > ttl) { personaPreviews.delete(key); sendJson({ ok: false, error: '预览已过期，请重新预览' }, 409); return; }
+          personaPreviews.delete(key);
+          const roleName = personaTargetRole();
+          const result = appendPersonaSupplement(roleName, text);
+          log(`[reserved2] 人设补充${result.written ? '已写入' : '已存在'} (${roleName})：${text.slice(0, 80)}`);
+          appendActivity(`${key} [reserved2] 人设补充${result.written ? '已写入' : '已存在'}：${text.slice(0, 80)}`);
+          sendJson({ ok: true, key, action: 'commit', role: roleName, written: result.written, alreadyExists: result.alreadyExists });
           return;
         }
         // ── 二代黑话学习（reserved2）：AI 查询/提交黑话候选 ─────────────────
