@@ -18,6 +18,7 @@
 //   R14 token 账本：被淘汰采样被新基线覆盖后不得重复计费
 //   R15 /api/send/* 失败路径的 st/now 越界（与 R2 同型，残留在这条旧发送工具真正走的端点）
 //   R16 reserved2 消息落库不得丢 kind/emojiId/summary/subType（表情 CDN 兜底与标签全靠它）
+//   R17 表情库 hex id 不得被当成正文发出去（T140）；R18 跨轮次复读给软提醒（T151）
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -432,6 +433,67 @@ await test('R16 appendSocialV2Message 保留 kind/emojiId/summary/subType', asyn
     assert.ok(dirty.length <= 60, `摘要必须限长（实得 ${dirty.length}）`);
     // 兜底地址仍然能从落库后的字段推出来（这是 fetchOneBotImage 的实际输入）。
     assert.match(String(h.emojiCdnCandidates(stored.media[0].emojiId)[0] ?? ''), /gxh\.vip\.qq\.com/, '落库字段应足以推出 CDN 兜底地址');
+  } finally { await h.close(); }
+});
+
+// ── R17. 表情库文件名当正文发出去：必须在端点拦下，并指路 qq_send_sticker ────
+// T140 实测：模型把 QQ 收藏表情的 id（`836923945_0_0_0_<32位HEX>_0_0`）当消息发了出去，
+// 群里出现一串十六进制。id 就是文件名形态，没有任何一层校验能挡住它。
+await test('R17 表情库 hex id 不会被当成正文发出去', async () => {
+  const h = await bridgeHarness();
+  const leak = '836923945_0_0_0_0278548D41D1FC132D63D936B193E4EC_0_0';
+  try {
+    h.setMode('reserved2');
+    const st = h.getSocialV2State('group:456');
+    await withServer(h, async (port) => {
+      for (const pathname of ['/api/socialV2/send-message', '/api/socialV2/send-burst']) {
+        const res = await call(port, pathname, {
+          method: 'POST', token: st.agentToken, body: { key: 'group:456', messages: [leak] }
+        });
+        assert.equal(res.status, 400, `${pathname} 应拒绝表情 id，实际 ${res.status} ${res.body}`);
+        assert.match(String(res.json?.error ?? ''), /qq_send_sticker/, `${pathname} 的报错要指路 qq_send_sticker`);
+      }
+      // 到这里为止，那两条被拒的消息一个字都不该到 OneBot。
+      const sendsBefore = h.calls.http.filter((c) => /send_(group|private)_msg$/.test(c.url));
+      assert.ok(!JSON.stringify(sendsBefore).includes(leak), '被拒的表情 id 绝不能出现在文本发送里');
+
+      // 混在正常句子里不算泄漏，不能误伤
+      const ok = await call(port, '/api/socialV2/send-message', {
+        method: 'POST', token: st.agentToken, body: { key: 'group:456', messages: [`我把 ${leak} 这个表情存下来了`] }
+      });
+      assert.equal(ok.status, 200, `夹在话里的 id 不应拦截，实际 ${ok.status} ${ok.body}`);
+      assert.equal(ok.json?.sent, 1);
+    });
+  } finally { await h.close(); }
+});
+
+// ── R18. 跨轮次复读：同一句原样再说一遍要给软提醒（不拦截） ─────────────────
+// T151 实测：上一轮说过的话，下一轮又原封不动发了一遍，读起来像复读机。
+// 判定必须拿**发送前**的快照比：recordSentMessagesV2 会把本批也写进 recentMessages。
+await test('R18 与最近说过的同一句会给 repeatWarn 软提醒', async () => {
+  const h = await bridgeHarness();
+  const said = '诶嘿就想糊弄过去呀，至少赔我一句正经的';
+  try {
+    h.setMode('reserved2');
+    const st = h.getSocialV2State('group:456');
+    st.recentMessages.push({
+      sender: '我', text: said, plain: said, quoteTargetIsSelf: false,
+      isOwner: true, ownerLabel: '我', isSelf: true, time: Date.now() - 60_000
+    });
+    await withServer(h, async (port) => {
+      const res = await call(port, '/api/socialV2/send-message', {
+        method: 'POST', token: st.agentToken, body: { key: 'group:456', messages: [`${said}。`] }
+      });
+      assert.equal(res.status, 200, '复读是软提醒，不能拦发送');
+      assert.equal(res.json?.sent, 1, '消息仍应真的发出去');
+      assert.match(String(res.json?.repeatWarn ?? ''), /第 1 条/, `应带上条号，实际 ${res.body}`);
+      // 短应答永远不算复读（真人天天说「嗯」）
+      const short = await call(port, '/api/socialV2/send-message', {
+        method: 'POST', token: st.agentToken, body: { key: 'group:456', messages: ['嗯'] }
+      });
+      assert.equal(short.status, 200);
+      assert.equal(short.json?.repeatWarn, undefined, `短应答不该被告知复读，实际 ${short.body}`);
+    });
   } finally { await h.close(); }
 });
 

@@ -19,6 +19,7 @@ import { SnowLumaWebSocketClient, text } from '@snowluma/sdk';
 import { NodeApiClient, unwrap, createTurnCollector, discoverDshLaunchToken } from './dsh-client.js';
 import { mdToPlain, splitForQQ, truncateText, truncateTextTail } from './md-to-plain.js';
 import { SENSITIVE_RE } from './sensitive.js';
+import { findRepeatedMessages, findStickerIdLeaks, repeatWarningText, resolveRepeatGuard } from './outbound-guard.js';
 import { looksLikeUnfinished } from './v2-wait.js';
 import { compactModelMessage } from './qq-model-view.js';
 import { BACKFILL_DEFAULTS, normalizeBackfillConfig, createUpstreamGapTracker, createSeenMessageIds, selectBackfill, describeDuration, backfillNoticeBlock } from './backfill.js';
@@ -142,7 +143,7 @@ import { MemoryService, defaultDbFile, parseStructuredDistill, parseLegacyMemory
 // 角色成长笔记（「自主升级」块）：state/growth/<角色名>.md 的读写 + 注入块 + 配额文件。
 import { growthFileFor, readTextSafe as readGrowthText, ensureGrowthFile, appendGrowthNote, resetGrowthFile, buildGrowthPromptBlock } from './growth.js';
 // 角色日记：state/diary/YYYY-MM-DD.md 的读写 + 注入块（她自己写，不是程序调 API 生成）。
-import { diaryFileFor, diaryDateOf, writeDiary, readDiaryRaw, readDiaryBody, buildDiaryPromptBlock, DIARY_INJECT_DAYS, DIARY_INJECT_MAX_CHARS } from './diary.js';
+import { diaryFileFor, diaryDateOf, writeDiary, readDiaryRaw, readDiaryBody, buildDiaryPromptBlock, DIARY_INJECT_DAYS, DIARY_INJECT_MAX_CHARS, DIARY_STYLE_GUIDE } from './diary.js';
 // v0.3.0：人际连续性（人物库/入群事件/跨群协作）与 owner 管理通道（模式切换/权限分级/审批增强）。
 // 业务规则全部在 src/social/* 与 src/admin/*，这里只接线。
 import { createBridgeExtensions, redactCredentials, normalizeMemberNotice, processMemberEvent, joinWakeInstruction, checkCrossGroup, queryPresence, queryActivity, resolveLevelPlan, permissionCommandSucceeded, L0_MODES, LEVEL_TEXT, parseOwnerCommandForGuard, createReconnectWatchdog, describeAgentError, agentErrorUserText, isConfigError, resolveDshBaseUrl, ownerRelayConfig, validateOwnerRelay, createOwnerRelayLimiter, createOwnerRelayStore, ownerRelayPromptBlock, ownerRelayResultText, ownerRelayNoticeText, GROUP_RULE_LIMITS, validateOwnerGroupAccess, normalizeRules, addRule, removeRule, rulesPromptBlock, peekView, groupRuleResultText, groupRuleNoticeText, isNapCatVersionInfo, looksLikePathOnlyError, stickerTempBase, writeTempSticker, findFavByMd5, napcatAddOk, qqBackendFromVersionInfo, qqBackendLabel, createDshHealth } from './bridge-extensions.js';
@@ -4268,12 +4269,25 @@ async function main() {
     if (cfg.socialV2?.diary?.enabled === false) return;
     const name = '日记提醒';
     const existing = scheduler.listTasks().find((t) => t.name === name && t.enabled);
-    if (existing) return;
+    // 文案随日记写法更新：老任务里存的 instruction 是旧版（"别逐条流水账"那套），
+    // 只创建不更新的话，已经建过任务的机器永远拿不到新写法。
+    const instruction = `写今天的日记（用 qq_diary_write，覆盖写 state/diary/YYYY-MM-DD.md）。回忆今天和柚宝、和群里的互动。${DIARY_STYLE_GUIDE}`;
+    if (existing) {
+      if (String(existing.instruction ?? '') !== instruction) {
+        try {
+          scheduler.updateTask(existing.id, { instruction }, { source: 'owner-command' });
+          log(`日记兜底任务 #${existing.id} 的写法已更新`);
+        } catch (error) {
+          log(`⚠️ 日记兜底任务写法更新失败：${error?.message ?? error}`);
+        }
+      }
+      return;
+    }
     try {
       const t = scheduler.createTask({
         name,
         kind: 'ai',
-        instruction: '写今天的日记（用 qq_diary_write，覆盖写 state/diary/YYYY-MM-DD.md）。回忆今天和柚宝、和群里的互动，把今天沉淀成一篇第一人称的感受，别逐条流水账。',
+        instruction,
         targets: [schedulerOwnerKey()],
         schedule: { type: 'daily', times: [String(cfg.socialV2?.diary?.reminderTime || '21:30')] },
         runDuringSilence: true,
@@ -7365,6 +7379,11 @@ async function main() {
             sendJson({ ok: false, error: `最多发送 ${maxMsgs} 条` }, 400);
             return;
           }
+          const stickerLeakBurst = rejectStickerIdLeak(messages);
+          if (stickerLeakBurst) {
+            sendJson({ ok: false, error: stickerLeakBurst }, 400);
+            return;
+          }
           for (const msg of messages) {
             if (msg.length > maxChars) {
               sendJson({ ok: false, error: `单条消息不能超过 ${maxChars} 字` }, 400);
@@ -7377,6 +7396,8 @@ async function main() {
           }
           const st = getSocialV2State(key);
           const now = Date.now();
+          // 发送前快照：复读判定的历史必须是"这一批发出去之前"的，见 findRepeatWarning 注释。
+          const recentBeforeSend = st.recentMessages.slice();
           try {
             const maxPerMinute = Number(sendCfg.maxSendPerMinute) || 0;
             const maxPerHour = Number(sendCfg.maxSendPerHour) || 0;
@@ -7402,7 +7423,8 @@ async function main() {
             const burstHint = messages.length >= 3 ? '你已经连发了多条，确认是必要的吗？真人很少一口气补完。' : undefined;
             const spaceWarn = findCjkSpaceWarning(messages);
             const splitWarn = findSplitBoundaryWarning(messages);
-            sendJson({ ok: true, key, sent: sentMessages.length, failed: messages.length - sentMessages.length, ...(burstHint ? { hint: burstHint } : {}), ...(spaceWarn ? { warn: spaceWarn } : {}), ...(splitWarn ? { splitWarn } : {}) });
+            const repeatWarn = findRepeatWarning(sentMessages, recentBeforeSend);
+            sendJson({ ok: true, key, sent: sentMessages.length, failed: messages.length - sentMessages.length, ...(burstHint ? { hint: burstHint } : {}), ...(spaceWarn ? { warn: spaceWarn } : {}), ...(splitWarn ? { splitWarn } : {}), ...(repeatWarn ? { repeatWarn } : {}) });
           } catch (error) {
             if (error?.sent?.length) {
               recordSentMessagesV2(key, error.sent);
@@ -7496,6 +7518,11 @@ async function main() {
             sendJson({ ok: false, error: `最多发送 ${maxMsgs} 条` }, 400);
             return;
           }
+          const stickerLeakSendMsg = rejectStickerIdLeak(messages);
+          if (stickerLeakSendMsg) {
+            sendJson({ ok: false, error: stickerLeakSendMsg }, 400);
+            return;
+          }
           for (const msg of messages) {
             if (msg.length > maxChars) {
               sendJson({ ok: false, error: `单条消息不能超过 ${maxChars} 字` }, 400);
@@ -7510,6 +7537,8 @@ async function main() {
           // 先做发送频率检查并预占额度，再解析引用目标，避免未限流的引用查询打爆 OneBot。
           const st = getSocialV2State(key);
           const now = Date.now();
+          // 发送前快照：复读判定的历史必须是"这一批发出去之前"的，见 findRepeatWarning 注释。
+          const recentBeforeSend = st.recentMessages.slice();
           const maxPerMinute = Number(sendCfg.maxSendPerMinute) || 0;
           const maxPerHour = Number(sendCfg.maxSendPerHour) || 0;
           const recentMinute = (st.sendTimes || []).filter((t) => now - t < 60000).length;
@@ -7551,7 +7580,8 @@ async function main() {
             const burstHint = messages.length >= 3 ? '你已经连发了多条，确认是必要的吗？真人很少一口气补完。' : undefined;
             const spaceWarn = findCjkSpaceWarning(messages);
             const splitWarn = findSplitBoundaryWarning(messages);
-            sendJson({ ok: true, key, sent: sentMessages.length, failed: messages.length - sentMessages.length, delays, quoted: quotedInfo, ...(burstHint ? { hint: burstHint } : {}), ...(spaceWarn ? { warn: spaceWarn } : {}), ...(splitWarn ? { splitWarn } : {}) });
+            const repeatWarn = findRepeatWarning(sentMessages, recentBeforeSend);
+            sendJson({ ok: true, key, sent: sentMessages.length, failed: messages.length - sentMessages.length, delays, quoted: quotedInfo, ...(burstHint ? { hint: burstHint } : {}), ...(spaceWarn ? { warn: spaceWarn } : {}), ...(splitWarn ? { splitWarn } : {}), ...(repeatWarn ? { repeatWarn } : {}) });
           } catch (error) {
             if (error?.sent?.length) {
               recordSentMessagesV2(key, error.sent);
@@ -10163,6 +10193,8 @@ async function main() {
           const sendCfg = cfg.socialV2?.send ?? {};
           const maxChars = Math.max(1, Number(sendCfg.maxMessageChars) || 500);
           if (message.length > maxChars) { sendJson({ ok: false, error: `单条消息不能超过 ${maxChars} 字` }, 400); return; }
+          const stickerLeakLegacy = rejectStickerIdLeak([message]);
+          if (stickerLeakLegacy) { sendJson({ ok: false, error: stickerLeakLegacy }, 400); return; }
           if (SENSITIVE_RE.test(message)) { sendJson({ ok: false, error: '消息含敏感信息，已阻止发送' }, 403); return; }
           // st/now 必须声明在 try **之外**：下面的 catch 要用它们回滚预占的发送额度。
           // 写在 try 里时 catch 拿到的是块作用域外的名字 ⇒ ReferenceError（send-burst
@@ -10171,6 +10203,8 @@ async function main() {
           // 且部分成功的已发消息不会被记进 recentMessages。
           const st = getSocialV2State(key);
           const now = Date.now();
+          // 发送前快照：复读判定的历史必须是"这一批发出去之前"的，见 findRepeatWarning 注释。
+          const recentBeforeSend = st.recentMessages.slice();
           try {
             const maxPerMinute = Number(sendCfg.maxSendPerMinute) || 0;
             const maxPerHour = Number(sendCfg.maxSendPerHour) || 0;
@@ -12937,6 +12971,24 @@ async function main() {
     }
     if (!bad.length) return null;
     return `第 ${bad.join('，')} 条之间像是把同一句话拆开了；如果两条拼起来才完整，请合并成一条，或把断点移到完整句子的边界。`;
+  }
+
+  // 检测二代发送内容里"这句话你刚说过"（跨轮次复读）。历史来源是 recentMessages 里自己发过的消息。
+  // 纯判定在 outbound-guard.js，这里只拼成软提醒。
+  // 必须传**发送前**的快照：recordSentMessagesV2 会把这一批消息也写进 recentMessages，
+  // 拿发送后的状态去比，每一句都会"和自己重复"。
+  function findRepeatWarning(messages, recentSnapshot) {
+    const hits = findRepeatedMessages(messages, recentSnapshot, resolveRepeatGuard(cfg.socialV2?.send?.repeatGuard));
+    return repeatWarningText(hits);
+  }
+
+  // 表情库文件名（`<uin>_0_0_0_<32位HEX>_0_0`）当正文发出去，是模型把 id 当成"表情"了。
+  // 这类消息一律拦下并指路 qq_send_sticker，不能让一串十六进制出现在群里。
+  function rejectStickerIdLeak(messages) {
+    const { indexes } = findStickerIdLeaks(messages);
+    if (!indexes.length) return null;
+    const label = indexes.length === 1 ? `第 ${indexes[0] + 1} 条` : `第 ${indexes.map((i) => i + 1).join('、')} 条`;
+    return `${label}消息是一串表情库的文件名（hex id），不是能发给人看的话。想发表情请用 qq_send_sticker，stickerId 传那个 id；想配一句话就把它放进 text 参数。`;
   }
 
   function currentRoleHintV2() {

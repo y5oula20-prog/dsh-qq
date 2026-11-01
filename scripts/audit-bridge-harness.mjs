@@ -30,6 +30,7 @@ import * as roleRefreshLib from '../src/role-refresh.js';
 import * as tokenLedger from '../src/token-ledger.js';
 import * as voiceLib from '../src/send-voice-lib.js';
 import * as presetPrompt from '../src/preset-prompt.js';
+import * as outboundGuard from '../src/outbound-guard.js';
 import * as stateAcl from '../src/state-acl.mjs';
 import * as bridgeExt from '../src/bridge-extensions.js';
 import * as groupMemory from '../src/group-memory.js';
@@ -216,7 +217,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     discoverDshLaunchToken: () => '', unwrap, createTurnCollector,
     ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...slang, ...sticker, ...stickerLimits,
     ...modelPrices, ...dshModel, ...quoteForward, ...modeHandover, ...roleCard, ...tokenLedger,
-    createScheduler, parseRemindCommand, REMIND_HELP, formatTaskList, createScheduledNoteStore, scheduledPromptBlock, scheduledDirectPrompt, describeInstant, createSilenceSchedule, peakPresetRanges, describeRange, ...roleRefreshLib, ...voiceLib, ...stateAcl, ...presetPrompt, ...bridgeExt,
+    createScheduler, parseRemindCommand, REMIND_HELP, formatTaskList, createScheduledNoteStore, scheduledPromptBlock, scheduledDirectPrompt, describeInstant, createSilenceSchedule, peakPresetRanges, describeRange, ...roleRefreshLib, ...voiceLib, ...stateAcl, ...presetPrompt, ...bridgeExt, ...outboundGuard,
     // 10-28~10-29 新增模块（语音/画画/唱歌/换声/黑话外挂/群记忆/成长笔记/连接发现）。
     // 曾经漏注入，导致 test-audit-bridge / test-role-refresh 在 VM 里跑出
     // `ReferenceError: readTextSafe is not defined` / `readGrowthText is not defined`。

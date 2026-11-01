@@ -70,7 +70,7 @@ test('pre-reply quiet checks, waiting for replies and pre-sleep observation have
 
 test('social autonomy and visual, forwarding, sticker and web capabilities remain described', () => {
   for (const text of [
-    '【反 AI 味：拒绝有求必应】', '【保持主体性】', '【学习群友策略】',
+    '【别像机器人】', '【保持主体性】', '【学习群友策略】',
     '【不要当群管家/主持人】', '普通对话默认 1 条，最多 2 条', '不要用空格断句',
     '不会自动发送到 QQ', 'qq_get_message_images', 'qq_get_forward_msg', 'nestedForwardIds',
     'qq_send_poke', 'qq_list_stickers', 'qq_get_sticker_image', 'qq_send_sticker',
@@ -94,7 +94,7 @@ test('autonomy limits and the observation escape hatch stay described', () => {
     // 黑话面
     'qq_slang_query', 'qq_slang_submit', '不重复提交',
     // 频率上限
-    '普通闲聊约 3~5 轮一张', '别刷屏', '每条只能一张，不能附带文字', '不要频繁拍',
+    '普通闲聊约 3~5 轮一张', '别刷屏', '每条只能一张，但 text 参数可以带一句短话', '不要频繁拍',
     // 会话令牌是硬前置，漏传会被拒绝。
     '作为 token 参数传入',
     // 指定成员唤醒
