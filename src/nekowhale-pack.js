@@ -17,8 +17,22 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
-/** 元数据托管地址。kiriyuki.com 自己的 /meme/kit/ 路径已 404，GitHub raw 稳定可用。 */
-export const NEKOWHALE_META_URL = 'https://raw.githubusercontent.com/Loping151/dsh-nekowhale-stickers/main/meta/nekowhale.json';
+/**
+ * 元数据地址，按顺序试第一个能用的。
+ *
+ * 为什么不是只留 raw.githubusercontent.com：它在本机直连实测 15 秒超时（走系统代理才通），
+ * 而桥接是被刻意摘掉代理变量跑的（见 control-center.mjs 的 PROXY_ENV_NAMES），所以只有
+ * raw 一个地址时首次启动必然拉不到元数据。jsDelivr 的 GitHub 镜像直连 846ms/160KB，稳。
+ * 三个地址内容完全一致（同一仓库同一文件），失败才换下一个。
+ */
+export const NEKOWHALE_META_URLS = [
+  'https://cdn.jsdelivr.net/gh/Loping151/dsh-nekowhale-stickers@main/meta/nekowhale.json',
+  'https://fastly.jsdelivr.net/gh/Loping151/dsh-nekowhale-stickers@main/meta/nekowhale.json',
+  'https://raw.githubusercontent.com/Loping151/dsh-nekowhale-stickers/main/meta/nekowhale.json'
+];
+
+/** 首选地址（对外保留，便于日志/测试引用）。真正的拉取逻辑按 NEKOWHALE_META_URLS 逐个试。 */
+export const NEKOWHALE_META_URL = NEKOWHALE_META_URLS[0];
 
 /** GIF 直链前缀（实测 200：https://kiriyuki.com/media/gif/大肥鱼/10N01_猫猫搓手.gif）。 */
 export const NEKOWHALE_GIF_BASE = 'https://kiriyuki.com/media/gif';
@@ -164,7 +178,20 @@ export function saveNekowhalePack(file, meta) {
  * 这样本文件不直接依赖网络实现，便于单测。
  */
 export async function fetchNekowhaleMeta(fetchJson) {
-  const raw = await fetchJson(NEKOWHALE_META_URL);
+  // 逐个地址试：镜像优先、raw 兜底。全部失败才抛，错误里带上每个地址的失败原因，
+  // 方便下次有人看到「元数据拉取失败」时一眼知道是网络还是内容问题。
+  const failures = [];
+  let raw = null;
+  for (const url of NEKOWHALE_META_URLS) {
+    try {
+      raw = await fetchJson(url);
+      break;
+    } catch (error) {
+      failures.push(`${new URL(url).host}：${error?.message ?? error}`);
+    }
+  }
+  if (raw === null) throw new Error(`所有元数据地址都失败（${failures.join('；')}）`);
+
   const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
   const list = Array.isArray(parsed?.stickers) ? parsed.stickers : [];
   const stickers = list.map(normalizeNekowhaleEntry).filter(Boolean);

@@ -22,9 +22,23 @@ export function killTree(pid) {
 }
 
 /**
+ * 把「要删掉的环境变量名」变成 spawn env 对象里的 undefined 值。
+ *
+ * Node 的 spawn 会跳过值为 undefined 的键，所以这是从子进程环境里**删除**变量的正规做法
+ * （直接 delete 父进程的 process.env 会污染同一进程里的其他逻辑）。
+ */
+function unsetEnvObject(names) {
+  const out = {};
+  for (const name of names ?? []) {
+    if (typeof name === 'string' && name) out[name] = undefined;
+  }
+  return out;
+}
+
+/**
  * @param {object} o
  * @param {string} o.name           'bridge' | 'snowluma'
- * @param {() => {command:string,args:string[],cwd:string,env?:object}|{error:string}} o.resolveLaunch  每次启动时重新计算（路径可能变）
+ * @param {() => {command:string,args:string[],cwd:string,env?:object,unsetEnv?:string[]}|{error:string}} o.resolveLaunch  每次启动时重新计算（路径可能变）
  * @param {number} [o.maxLines]     内存里保留的日志行数
  * @param {string} [o.logDir]       日志落盘目录（按天滚动）
  * @param {(line:string)=>string} [o.redact]
@@ -84,7 +98,8 @@ export function createManagedProcess({ name, resolveLaunch, maxLines = 3000, log
     try {
       proc = spawn(launch.command, launch.args, {
         cwd: launch.cwd,
-        env: { ...process.env, ...(launch.env ?? {}) },
+        // unsetEnv 里的键一律从子进程环境删掉（值为 undefined ⇒ Node 不传给子进程）。
+        env: { ...process.env, ...unsetEnvObject(launch.unsetEnv), ...(launch.env ?? {}) },
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
         detached: process.platform !== 'win32',

@@ -192,6 +192,30 @@ const BINARY_REQUEST_TIMEOUT_MS = 60000;
 const BINARY_MAX_ADDRESS_ATTEMPTS = 6;
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
+// ── 代理环境变量守卫 ─────────────────────────────────────────────────────────
+// 本文件的防护顺序是「解析域名 → 校验全部解析结果不是内网 → 锁住已校验的那个 IP 去连」。
+// 但 Node 22 只要看到 NODE_USE_ENV_PROXY=1 且环境里有 http_proxy/https_proxy，
+// 就会给全局 fetch/undici 装 EnvHttpProxyAgent，代理会**自己再解析一次域名**：
+// 实测 http:// 请求送到代理的是完整 URL（不是 IP），IP 锁定那一层直接失效；
+// https:// 虽然 CONNECT 到 IP，但那是代理侧解析的结果，不是我们校验过的那个。
+// 前置的 isPrivateIp 拦截仍然有效，所以这不是「可以随便打内网」的洞，但设计意图确实被绕过了。
+// 这里不抛错（开了代理的人可能就是要用代理），只警告一次，让日志里查得到原因。
+let proxyWarningShown = false;
+function warnIfProxyHijacksGuard() {
+  if (proxyWarningShown) return;
+  if (String(process.env.NODE_USE_ENV_PROXY ?? '') !== '1') return;
+  const proxies = ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY']
+    .filter((k) => String(process.env[k] ?? '').trim());
+  if (!proxies.length) return;
+  proxyWarningShown = true;
+  const detail = proxies.map((k) => `${k}=${process.env[k]}`).join(' ');
+  console.warn(
+    `[safe-fetch] 警告：检测到 NODE_USE_ENV_PROXY=1（${detail}）。` +
+    'Node 会用环境代理接管连接，本模块「先校验 IP 再锁住该 IP」的防 DNS-rebinding 设计被代理绕过；' +
+    '内网地址仍然会被前置校验挡住。若不需要代理，请从环境里去掉这些变量。'
+  );
+}
+
 function validateLimit(value, name) {
   if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${name} 必须为正整数`);
 }
@@ -369,6 +393,7 @@ async function requestOnce(url, addresses, limit, binary = false) {
 
 export async function safeFetch(urlString, maxChars = 50000) {
   validateLimit(maxChars, 'maxChars');
+  warnIfProxyHijacksGuard();
   const MAX_REDIRECTS = 5;
   let { url, addresses } = await validateFetchUrl(urlString);
   for (let i = 0; i <= MAX_REDIRECTS; i++) {
@@ -403,6 +428,7 @@ export function looksLikeImageBuffer(buf) {
 /** 抓取图片字节并返回 Buffer（带 SSRF 防护，且校验确实为图片）。 */
 export async function safeFetchBuffer(urlString, maxBytes = 8 * 1024 * 1024) {
   validateLimit(maxBytes, 'maxBytes');
+  warnIfProxyHijacksGuard();
   const MAX_REDIRECTS = 5;
   let { url, addresses } = await validateFetchUrl(urlString);
   for (let i = 0; i <= MAX_REDIRECTS; i++) {

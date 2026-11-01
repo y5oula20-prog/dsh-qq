@@ -8677,9 +8677,9 @@ async function main() {
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('listStickers')) { sendJson({ ok: false, error: '工具未启用：qq_list_stickers' }, 403); return; }
           try {
-            const synced = await syncStickerLibrary(force);
-            const list = formatStickerList(synced?.entries ?? stickerEntries, query, count);
-            sendJson({ ok: true, key, ...list, syncedAt: synced?.syncedAt ?? stickerSyncedAt, fromCache: synced?.fromCache ?? false });
+            // 同上：走 listStickersForV2 才能带上 nekowhale 那一节。
+            const list = await listStickersForV2(query, count, false);
+            sendJson({ ok: true, key, ...list, syncedAt: stickerSyncedAt, fromCache: false });
           } catch (error) {
             sendJson({ ok: false, error: `获取表情列表失败：${error?.message ?? error}` }, 500);
           }
@@ -8704,9 +8704,11 @@ async function main() {
             else lastForcedAgentStickerSync = now;
           }
           try {
-            const synced = await syncStickerLibrary(force);
-            const list = formatStickerList(synced?.entries ?? stickerEntries, query, count);
-            sendJson({ ok: true, key, ...list, syncedAt: synced?.syncedAt ?? stickerSyncedAt, fromCache: synced?.fromCache ?? false });
+            // 走 listStickersForV2 而不是直接 formatStickerList：前者会额外带上
+            // result.nekowhale 那一节（「大肥鱼」套组索引）。直接调 formatStickerList
+            // 会让 AI 只能看到 QQ 收藏表情，286 张套组在工具层面等于不存在。
+            const list = await listStickersForV2(query, count, force);
+            sendJson({ ok: true, key, ...list, syncedAt: stickerSyncedAt, fromCache: false });
           } catch (error) {
             sendJson({ ok: false, error: `获取表情列表失败：${error?.message ?? error}` }, 500);
           }

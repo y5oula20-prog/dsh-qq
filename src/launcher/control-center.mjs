@@ -53,6 +53,16 @@ function setRoot(root) {
 }
 setRoot(DEFAULT_ROOT);
 
+// ── 代理环境变量 ──────────────────────────────────────────────────────────────
+// 桥接/平台由控制中心 spawn 出来，会继承控制中心自己的环境。如果这个环境里带着
+// http_proxy / https_proxy / NODE_USE_ENV_PROXY（本机常见：代理软件开着时导出的），
+// 而代理进程又恰好停了，那桥接的所有出网请求都会先连代理、连不上就失败
+// （实测报错：「[nekowhale] 元数据拉取失败：connect ECONNREFUSED 127.0.0.1:7897」）。
+// 更要紧的是 NODE_USE_ENV_PROXY 会让 Node 内置的 EnvHttpProxyAgent 接管连接，
+// safe-fetch 辛苦做的「先解析并校验 IP，再锁住这个 IP 去连」就被绕过去了。
+// 所以起子进程时一律把这些变量摘掉：桥接只需要直连，该不该走代理由人决定，不该由它猜。
+const PROXY_ENV_NAMES = ['http_proxy', 'https_proxy', 'all_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NODE_USE_ENV_PROXY'];
+
 // ── 小工具 ────────────────────────────────────────────────────────────────────
 
 function readJson(file, fallback = null) {
@@ -241,7 +251,7 @@ export async function startControlCenter({ open = true, port: portOverride = nul
       const cfg = bridgeConfig();
       if (!cfg.valid) return { error: cfg.error };
       if (!fs.existsSync(path.join(ROOT, 'node_modules'))) return { error: '还没有安装依赖：请在项目目录运行 npm ci' };
-      return { command: process.execPath, args: [bridgeEntry ?? path.join(ROOT, 'src', 'bridge.js')], cwd: ROOT, env: { QQ_BRIDGE_SUPERVISED: '1' }, display: 'node src/bridge.js' };
+      return { command: process.execPath, args: [bridgeEntry ?? path.join(ROOT, 'src', 'bridge.js')], cwd: ROOT, env: { QQ_BRIDGE_SUPERVISED: '1' }, unsetEnv: PROXY_ENV_NAMES, display: 'node src/bridge.js' };
     },
     // 退出码 2 = 已有另一个桥接实例（锁文件），1 且无配置 = 配置问题：重启也没用。
     shouldRestart: ({ code }) => code !== 0 && code !== 2 && bridgeConfig().valid,
@@ -277,7 +287,7 @@ export async function startControlCenter({ open = true, port: portOverride = nul
     resolveLaunch: () => {
       const entry = platformEntry ?? path.join(platformSettings.dir, 'src', 'index.mjs');
       if (!fs.existsSync(entry)) return { error: `找不到接口平台：${entry}。接口平台默认在仓库里的 interface-platform/（旧版放在桥接目录的同级也认）；也可以在 state/control-center.json 里设 "platformDir"，或设环境变量 QQ_BRIDGE_PLATFORM_DIR` };
-      return { command: process.execPath, args: [entry, '--port', String(platformPort())], cwd: path.dirname(path.dirname(entry)), env: { INTERFACE_PLATFORM_ADMIN_TOKEN: platformKey }, display: `node ${path.join('interface-platform', 'src', 'index.mjs')} --port ${platformPort()}` };
+      return { command: process.execPath, args: [entry, '--port', String(platformPort())], cwd: path.dirname(path.dirname(entry)), env: { INTERFACE_PLATFORM_ADMIN_TOKEN: platformKey }, unsetEnv: PROXY_ENV_NAMES, display: `node ${path.join('interface-platform', 'src', 'index.mjs')} --port ${platformPort()}` };
     },
     // 退出码 3 = 启动失败（配置错误 / 端口被占用），重启也没用
     shouldRestart: ({ code }) => code !== 0 && code !== 3,
