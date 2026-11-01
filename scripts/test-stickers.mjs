@@ -75,6 +75,27 @@ console.log('## sticker-lib 纯函数');
 }
 
 {
+  // 2026-11-01：两张不同 md5 的图共用同一句备注时，列表里必须能区分，否则模型只能瞎挑。
+  const dup = [
+    normalizeStickerEntry({ emoji_id: 'x1', resId: 'x1', url: 'https://x/1', md5: '9D165C03885916ADE13FBECD32721BD5', desc: '我到底加了个什么群啊', localNote: '银发女孩坐电脑前，表情困惑' }),
+    normalizeStickerEntry({ emoji_id: 'x2', resId: 'x2', url: 'https://x/2', md5: '0278548D41D1FC132D63D936B193E4EC', desc: '我到底加了个什么群啊', localNote: '白发动漫女孩坐电脑前' }),
+    normalizeStickerEntry({ emoji_id: 'y', resId: 'y', url: 'https://x/y', md5: 'AAA', desc: '笑死' })
+  ];
+  const ctx = buildStickerContext(dup, 8);
+  ok(ctx.includes('银发女孩'), '重名表情补上第一张的区分提示');
+  ok(ctx.includes('白发动漫女孩'), '重名表情补上第二张的区分提示');
+  const uniqueLine = ctx.split('\n').find((line) => line.includes('- 笑死')) || '';
+  ok(!uniqueLine.includes('〔'), '不重名的表情不补区分提示');
+
+  // 没有 localNote 时退到 md5 前 6 位（至少能稳定区分成两张不同的图）
+  const noNote = buildStickerContext([
+    normalizeStickerEntry({ emoji_id: 'z1', resId: 'z1', url: 'https://x/z1', md5: 'ABCDEF123456', desc: '同一个备注' }),
+    normalizeStickerEntry({ emoji_id: 'z2', resId: 'z2', url: 'https://x/z2', md5: '654321FEDCBA', desc: '同一个备注' })
+  ], 8);
+  ok(noNote.includes('图 ABCDEF') && noNote.includes('图 654321'), '没有笔记时用 md5 前 6 位区分');
+}
+
+{
   const list = mergeStickerLibrary([], [
     { emoji_id: 'a', resId: 'a', url: 'https://x/a', md5: 'ABC', desc: '笑死' }
   ]);

@@ -10,6 +10,7 @@ import {
   resolveRepeatGuard,
   findRepeatedMessages,
   repeatWarningText,
+  alreadyIngested,
   REPEAT_GUARD_DEFAULTS
 } from '../src/outbound-guard.js';
 
@@ -94,4 +95,17 @@ test('提醒文案带上条号与原话，没有命中返回 null', () => {
   assert.match(text, /第 1 条/);
   assert.match(text, /原话/);
   assert.match(text, /换个说法/);
+});
+
+test('已在消息流里的 messageId 会被认出来（桥接重启后 seen 清空的兜底）', () => {
+  const unread = [{ seq: 119, messageId: '515816124', text: '还要看这个补丁能不能用嘞' }];
+  const recent = [{ sender: '我', text: '那你赶紧试去', isSelf: true, time: 1 }];
+  assert.equal(alreadyIngested(unread, '515816124'), true);
+  assert.equal(alreadyIngested(unread, 515816124), true, '实时是数字、补收可能是字符串，都要认');
+  assert.equal(alreadyIngested(recent, '515816124'), false, '自己的发言没有 messageId，不能误判');
+  assert.equal(alreadyIngested([], '515816124'), false);
+  assert.equal(alreadyIngested(null, '515816124'), false);
+  assert.equal(alreadyIngested(unread, null), false);
+  assert.equal(alreadyIngested(unread, ''), false);
+  assert.equal(alreadyIngested([{ messageId: null }, { text: 'x' }], '1'), false);
 });

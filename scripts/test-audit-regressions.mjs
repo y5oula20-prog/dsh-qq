@@ -19,7 +19,7 @@
 //   R15 /api/send/* 失败路径的 st/now 越界（与 R2 同型，残留在这条旧发送工具真正走的端点）
 //   R16 reserved2 消息落库不得丢 kind/emojiId/summary/subType（表情 CDN 兜底与标签全靠它）
 //   R17 表情库 hex id 不得被当成正文发出去（T140）；R18 跨轮次复读给软提醒（T151）
-//   R19 补收去重集合必须真的被 add（否则补收重复喂消息，快照里同 messageId 两条）
+//   R19 同一条 QQ 消息只能进一次消息流（seen 是内存集合，桥接重启就清空）
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -498,20 +498,26 @@ await test('R18 与最近说过的同一句会给 repeatWarn 软提醒', async (
   } finally { await h.close(); }
 });
 
-// ── R19. 补收去重：seenMsgIds 必须真的被 add ──────────────────────────────────
-// 故障形态：createSeenMessageIds() 在 main() 里创建、被传给 selectBackfill 当 seen，
-// 但全仓没有一处 seenMsgIds.add(...) ⇒ seen.has() 恒为 false ⇒ 断线补收会把
-// **已经实时喂过**的消息再补一遍。实测 20:21 的唤醒快照里同 messageId 出现两条
-// （seq 119/120 又成 121/122，带 backfill:true），她在一轮里读到同一句话两遍。
-await test('R19 补收去重集合必须被登记，且与 selectBackfill 共用同一个实例', async () => {
+// ── R19. 同一条 QQ 消息只能进一次消息流 ──────────────────────────────────────
+// 故障形态（2026-11-01 20:21 实测）：seq 119/120 实时收下，seq 121/122 是补收又拉了一遍，
+// 同一对 messageId（515816124 / 744078652）在同一份唤醒快照里出现两次。
+// 根因不是"seen 没被 add"（handleIncoming 一直有 add），而是 **seenMsgIds 是内存集合**：
+// 20:08 实时收下 → 20:09 控制中心退出、桥接重启 → 新进程 seen 是空的 → 补收重新拉回那两条。
+// 所以去重必须落在消息流本身：未读或最近记录里已有同 messageId 就不要再记。
+await test('R19 同一 messageId 不得重复进消息流（seen 内存集合重启即失效）', async () => {
   const src = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'bridge.js'), 'utf8');
   assert.match(src, /const seenMsgIds = createSeenMessageIds\(\)/,
     'bridge.js 必须创建补收去重集合');
   assert.match(src, /seenMsgIds\.add\(/,
-    'bridge.js 必须往补收去重集合里登记消息 id —— 只创建不 add 时 seen.has() 恒为 false，'
-    + '补收会把实时喂过的消息再喂一遍（R19 的原始故障）');
+    'bridge.js 必须往补收去重集合里登记消息 id，补收侧 selectBackfill 靠它跳过快路径');
   assert.match(src, /selectBackfill\([^)]*seen:\s*seenMsgIds/,
     'selectBackfill 必须收到同一个集合，否则去重形同虚设');
+  // 真正的兜底：appendSocialV2Message 要用 alreadyIngested 查重未读与最近记录
+  assert.match(src, /if \(alreadyIngested\(st\.unread, messageId\) \|\| alreadyIngested\(st\.recentMessages, messageId\)\) return null;/,
+    'appendSocialV2Message 必须查 st.unread 与 st.recentMessages（桥接重启后 seen 清空，'
+    + '只靠 seen 挡不住补收重复），命中就直接返回、不 push 第二条');
+  assert.match(src, /import \{[^}]*alreadyIngested[^}]*\} from '\.\/outbound-guard\.js'/,
+    'alreadyIngested 必须从 outbound-guard.js 引入（那是唯一实现，别在 bridge 里再写一份）');
 });
 
 if (failures) {

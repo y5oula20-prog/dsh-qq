@@ -101,3 +101,21 @@ export function repeatWarningText(hits) {
   const label = hits.length === 1 ? `第 ${hits[0].index + 1} 条` : `第 ${hits.map((h) => h.index + 1).join('、')} 条`;
   return `${label}和你刚说过的一模一样（“${hits[0].previous}”）。真人不会原封不动再说一遍：换个说法，或者干脆不说。`;
 }
+
+/**
+ * 这条 QQ 消息是不是已经在消息流里了。
+ *
+ * 起因（2026-11-01）：`seenMsgIds`（src/backfill.js）是内存集合，桥接一重启就清空，
+ * 所以补收会把上一个进程已经实时收过的消息再拉一遍 —— 20:21 的唤醒快照里同一对
+ * messageId 出现了两次（seq 119/120 无标记、seq 121/122 带 backfill 标记）。
+ * 去重因此不能只靠 seen，还要比对消息流本身。
+ *
+ * @param {Array} messages 消息流（st.unread / st.recentMessages）
+ * @param {string|number} messageId QQ 消息 id
+ * @returns {boolean}
+ */
+export function alreadyIngested(messages, messageId) {
+  if (messageId == null || messageId === '') return false;
+  const id = String(messageId);
+  return (Array.isArray(messages) ? messages : []).some((m) => m && m.messageId != null && String(m.messageId) === id);
+}

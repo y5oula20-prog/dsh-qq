@@ -19,7 +19,7 @@ import { SnowLumaWebSocketClient, text } from '@snowluma/sdk';
 import { NodeApiClient, unwrap, createTurnCollector, discoverDshLaunchToken } from './dsh-client.js';
 import { mdToPlain, splitForQQ, truncateText, truncateTextTail } from './md-to-plain.js';
 import { SENSITIVE_RE } from './sensitive.js';
-import { findRepeatedMessages, findStickerIdLeaks, repeatWarningText, resolveRepeatGuard } from './outbound-guard.js';
+import { alreadyIngested, findRepeatedMessages, findStickerIdLeaks, repeatWarningText, resolveRepeatGuard } from './outbound-guard.js';
 import { looksLikeUnfinished } from './v2-wait.js';
 import { compactModelMessage } from './qq-model-view.js';
 import { BACKFILL_DEFAULTS, normalizeBackfillConfig, createUpstreamGapTracker, createSeenMessageIds, selectBackfill, describeDuration, backfillNoticeBlock } from './backfill.js';
@@ -13303,12 +13303,16 @@ async function main() {
   // ── 二代仿真模式（reserved2）唤醒调度 ──────────────────────────────────
   function appendSocialV2Message(key, sender, textContent, plainContent, quoteTargetIsSelf, isOwner, messageId, media = [], userId = null, forwardIds = [], extra = {}) {
     const st = getSocialV2State(key);
-    // 补收去重（T151 的连带 bug）：每条真正进过对话的消息都在这里登记一次，
-    // selectBackfill 用同一个集合跳过"已经实时喂过"的消息。
-    // 2026-11-01 之前 createSeenMessageIds() 只在 :4999 创建、从没 add 过，
-    // 所以 seen.has() 恒为 false ⇒ 断线补收会把实时收到过的消息再补一遍，
-    // 20:21 的唤醒快照里就出现过同 messageId 两条（seq 119/120 又成 121/122）。
-    if (messageId != null && messageId !== '') seenMsgIds.add(key, messageId);
+    // 同一条 QQ 消息只能进一次消息流。
+    // seenMsgIds（src/backfill.js）是**内存**集合，桥接一重启就清空：2026-11-01 20:08 那两条
+    // 就是这么重复的 —— 旧进程实时收下（seq 119/120），20:09 控制中心退出、桥接重启，
+    // 新进程补收时 seen 是空的，于是又拉了一遍（seq 121/122，带 backfill 标记）。
+    // 所以去重不能只靠 seen，必须落在消息流本身：未读或最近记录里已经有同 messageId 的，
+    // 就当成同一条消息，不再记第二次。
+    if (messageId != null && messageId !== '') {
+      seenMsgIds.add(key, messageId);
+      if (alreadyIngested(st.unread, messageId) || alreadyIngested(st.recentMessages, messageId)) return null;
+    }
     const recentLimit = Number(cfg.socialV2?.context?.recentLimit) || 100;
     const unreadLimit = Number(cfg.socialV2?.context?.unreadLimit) || 30;
     // 存储层的归一化**不能只留 kind/file/url/faceId**：reserved2 的图片/表情工具
