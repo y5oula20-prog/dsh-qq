@@ -266,6 +266,17 @@ test('守卫导出的名单与本测试的清单一致（防两份名单各自�
       assert.ok(!mod.RESTRICTED_TOOL_NAMES.includes(allowed),
         `${id}: ${allowed} 是无害模型侧工具，不应出现在 restrict 名单里（会与 SAFE_EXACT 自相矛盾）`);
     }
+    // 2026-11-01：memu 的**本会话**记忆面必须真的从名单里拿掉，否则 schema 里看不到它们，
+    // dsh-memu-memory 的规则段就会自我作废（「没有 memu_* 工具就忽略本段」）。
+    for (const name of ['memu_private_recall', 'memu_private_remember', 'memu_private_list', 'memu_status']) {
+      assert.ok(!mod.RESTRICTED_TOOL_NAMES.includes(name),
+        `${id}: ${name} 必须从 restrict 名单移除，否则她看不到记忆工具、记忆功能静默失效`);
+    }
+    // 跨会话的 memu_global_* 必须留在名单里（能读桌面侧记忆库，两套不该串）。
+    for (const name of ['memu_global_list', 'memu_global_recall']) {
+      assert.ok(mod.RESTRICTED_TOOL_NAMES.includes(name),
+        `${id}: ${name} 必须留在 restrict 名单里（跨会话记忆会串到桌面）`);
+    }
   }
 });
 
@@ -309,6 +320,18 @@ test('守卫仍放行 QQ MCP 命名空间与无害模型侧工具', async () => 
     }
     for (const name of ['ask_user_question', 'todo_write']) {
       assert.equal(fakeTools._guard({ name }), undefined, `${id}: ${name} 应放行`);
+    }
+    // 2026-11-01：memu 的**本会话**记忆面必须放行。dsh-memu-memory 的记忆规则段结尾写着
+    // 「若本会话的工具列表里没有 memu_* 工具，请忽略本段」—— 整族 restrict 掉等于让模型
+    // 被告知"别用记忆"，记忆功能静默失效；而 private_* 只绑本会话的记忆库，不跨会话。
+    for (const name of ['memu_private_recall', 'memu_private_remember', 'memu_status']) {
+      assert.equal(fakeTools._guard({ name }), undefined,
+        `${id}: ${name} 应放行（本会话记忆面）`);
+    }
+    // 跨会话的 memu_global_* 仍必须拒绝：它能读到桌面侧的记忆库，与 QQ 侧两套不该串。
+    for (const name of ['memu_global_list', 'memu_global_recall']) {
+      assert.ok(typeof fakeTools._guard({ name }) === 'string',
+        `${id}: ${name} 必须拒绝（跨会话记忆，会串到桌面）`);
     }
     // 未知工具名必须 fail-closed。
     for (const name of ['', null, undefined, 'mcp__unknown__x', 'totally_new_tool']) {

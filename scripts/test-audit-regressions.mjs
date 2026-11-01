@@ -19,6 +19,7 @@
 //   R15 /api/send/* 失败路径的 st/now 越界（与 R2 同型，残留在这条旧发送工具真正走的端点）
 //   R16 reserved2 消息落库不得丢 kind/emojiId/summary/subType（表情 CDN 兜底与标签全靠它）
 //   R17 表情库 hex id 不得被当成正文发出去（T140）；R18 跨轮次复读给软提醒（T151）
+//   R19 补收去重集合必须真的被 add（否则补收重复喂消息，快照里同 messageId 两条）
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -495,6 +496,22 @@ await test('R18 与最近说过的同一句会给 repeatWarn 软提醒', async (
       assert.equal(short.json?.repeatWarn, undefined, `短应答不该被告知复读，实际 ${short.body}`);
     });
   } finally { await h.close(); }
+});
+
+// ── R19. 补收去重：seenMsgIds 必须真的被 add ──────────────────────────────────
+// 故障形态：createSeenMessageIds() 在 main() 里创建、被传给 selectBackfill 当 seen，
+// 但全仓没有一处 seenMsgIds.add(...) ⇒ seen.has() 恒为 false ⇒ 断线补收会把
+// **已经实时喂过**的消息再补一遍。实测 20:21 的唤醒快照里同 messageId 出现两条
+// （seq 119/120 又成 121/122，带 backfill:true），她在一轮里读到同一句话两遍。
+await test('R19 补收去重集合必须被登记，且与 selectBackfill 共用同一个实例', async () => {
+  const src = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'bridge.js'), 'utf8');
+  assert.match(src, /const seenMsgIds = createSeenMessageIds\(\)/,
+    'bridge.js 必须创建补收去重集合');
+  assert.match(src, /seenMsgIds\.add\(/,
+    'bridge.js 必须往补收去重集合里登记消息 id —— 只创建不 add 时 seen.has() 恒为 false，'
+    + '补收会把实时喂过的消息再喂一遍（R19 的原始故障）');
+  assert.match(src, /selectBackfill\([^)]*seen:\s*seenMsgIds/,
+    'selectBackfill 必须收到同一个集合，否则去重形同虚设');
 });
 
 if (failures) {

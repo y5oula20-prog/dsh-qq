@@ -169,10 +169,11 @@ const USELESS_IN_QQ_TOOLS = [
   // 2026-10-31：memu 记忆（桌面侧独立记忆库）。
   // scan-dsh-tool-names.mjs 把 memu_global_* 报成「危险语义未覆盖」：它们能读宿主的
   // 全局记忆库，而 QQ 侧自有一套 memory/note_person 体系，两套不该串。
-  'memu_global_list', 'memu_global_recall', 'memu_status',
-  'memu_private_list', 'memu_private_recall', 'memu_private_remember',
-  'memu_private_update', 'memu_private_archive', 'memu_private_link',
-  'memu_private_unpin',
+  // 2026-11-01 收窄：只留 global_*。private_* 与 status 放回白名单（见 SAFE_PREFIXES）——
+  // dsh-memu-memory 的记忆规则段结尾写着「若本会话的工具列表里没有 memu_* 工具，请忽略本段」，
+  // 把整族 restrict 掉等于让她被告知"别用记忆"，记忆功能实际是关的；而 private_* 绑的是
+  // 本会话自己的记忆库，不跨会话，串不到桌面内容。global_* 才是跨会话的，继续关。
+  'memu_global_list', 'memu_global_recall',
   // 2026-10-31：阿里云百炼 MCP（mcp-bailian）。桌面侧做批量文本/识图用的，
   // 群聊里每一次调用都会把 QQ 内容发到阿里云 —— 既用不上，也没必要开这个出口。
   // 执行期白名单本来就拒（SAFE_PREFIXES 里没有它），这里补 restrict 是为了别占 schema。
@@ -234,6 +235,10 @@ export const SAFE_PREFIXES = [
   //   调用中 univer_* 一次都没用过。现在它走 KNOWN_DANGEROUS_GLOBAL_TOOLS 被 restrict 隐藏。
   //   要恢复：把 'univer_' 加回这里，并把下面 univer 那 15 个名字从名单里去掉。
   'whale_dive_',
+  // 2026-11-01：memu 的**本会话**记忆面（list/recall/remember/update/archive/link/unpin）。
+  // 它们只读写绑定在本会话上的记忆库，不跨会话；跨会话的 memu_global_* 仍在
+  // KNOWN_DANGEROUS_GLOBAL_TOOLS 里被 restrict 掉，执行期白名单也不会放行它们。
+  'memu_private_',
 ]
 
 // 无害模型侧工具：ask_user_question 用于把问题转给管理员/用户，
@@ -253,6 +258,9 @@ export const SAFE_EXACT = new Set([
   'acp_status',
   'acp_cache',
   'acp_read_original_image',
+  // 2026-11-01：记忆引擎自检（只读，报引擎/记忆库/绑定状态）。放它进来是为了
+  // 她（或 owner 在群里问"你记得什么"时）能自己确认记忆到底通没通。
+  'memu_status',
 ])
 
 /**
