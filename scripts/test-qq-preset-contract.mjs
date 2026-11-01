@@ -23,10 +23,13 @@ test('reserved2 YAML resolves to the expected persona and template variables', (
 
 test('local/admin tool restrictions and existing compaction budgets stay intact', () => {
   assert.deepEqual(preset.map((row) => row.id), [
-    'persona', 'tool-web', 'tool-ask-user', 'tool-todo', 'qq-tool-restrict', 'compaction',
+    'persona', 'tool-web', 'tool-ask-user', 'tool-todo', 'qq-tool-restrict', 'qq-prompt-trim', 'compaction',
   ]);
   assert.deepEqual(preset.find((row) => row.id === 'tool-web').config, { search: false, fetch: false });
   assert.equal(preset.find((row) => row.id === 'qq-tool-restrict').name, './qq-tool-restrict.mjs');
+  // 2026-11-01 L2：提示词瘦身行必须在 preset 里，否则部署层会把「你是 AI agent」
+  // 和 4,000 字编程说明书塞进每一轮 system prompt。
+  assert.equal(preset.find((row) => row.id === 'qq-prompt-trim').name, './qq-prompt-trim.mjs');
   const compaction = preset.find((row) => row.id === 'compaction');
   assert.deepEqual(compaction.isolate, { compaction: true, toolResultPruner: true });
   assert.deepEqual(compaction.config.find((row) => row.id === 'tool-result-pruner').config, {

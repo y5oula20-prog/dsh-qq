@@ -47,6 +47,8 @@ export const RELATIVE_ROW_REWRITES = new Map([
   ['./qq-tool-restrict.mjs', GUARD_SPECIFIER],
   // v0.3.0：L2/L3 运维 preset 的审批闸门（同一个 bundle 内的唯一实现）。
   ['./qq-approval-gate.mjs', 'qq-agent-presets/qq-approval-gate.mjs'],
+  // 2026-11-01 L2：提示词瘦身（同名空 section shadow 掉部署层身份句与编程 Agent 说明书）。
+  ['./qq-prompt-trim.mjs', 'qq-agent-presets/qq-prompt-trim.mjs'],
 ]);
 
 export const BUNDLE_DIR = path.join(REPO_ROOT, 'plugins', 'qq-agent-presets');

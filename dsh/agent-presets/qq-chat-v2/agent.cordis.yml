@@ -167,6 +167,17 @@
   name: ./qq-tool-restrict.mjs
   config: {}
 
+# ── 提示词瘦身 ───────────────────────────────────────────────────────────────
+# 部署层每轮都会往 system prompt 里塞「你是 AI agent」「你是编程 Agent，ops_bash 怎么用」
+# 这类段落（实测约 6,000 字）。这里在 preset 作用域注册同名空 section，把它们 shadow 掉：
+# renderPrompt() 会 filter 掉空串，等于删除。只对 QQ 会话生效，不动桌面全局配置。
+# 详见 plugins/qq-agent-presets/qq-prompt-trim.mjs 的头注释。
+# 2026-11-01 L2。
+
+- id: qq-prompt-trim
+  name: ./qq-prompt-trim.mjs
+  config: {}
+
 # ── 上下文管理（保留，避免长聊爆上下文） ────────────────────────────────────
 
 - id: compaction

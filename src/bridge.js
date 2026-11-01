@@ -11441,7 +11441,25 @@ async function main() {
         ext.audit.append('permission.pinned', { key, sessionId, level: currentLevel, preset: agentPlan.permissionPreset, agentPreset: agentPlan.agentPreset || '(DSH 默认)' });
       } else if (strictPreset && cfg.admin?.pinChatReadOnly !== false && api.commands?.execute) {
         // 群友会话本来就没有本地工具；再钉一个 read-only 是纵深防御，失败不影响聊天。
-        try { await api.commands.execute(sessionId, '/permission read-only'); } catch {}
+        //
+        // 2026-11-01：原来这里是 `catch {}` —— 钉失败完全无声。实测后果很具体：
+        // dsh-ops 的 mountSessionBash 只对 `danger-full-access`（或存在 sandbox.confine）
+        // 的会话发布 ops_bash；read-only 没钉上 ⇒ 退回 DSH 默认权限 ⇒ 31 轮 schema 里
+        // 全程都有 ops_bash，而那一次她真的拿它跑了 `sleep 25` 等桥接恢复。
+        // 所以失败必须留痕（日志 + 审计），但仍然不 throw：聊天会话不该因为
+        // 一个纵深防御没生效就建不出来。
+        try {
+          const r = unwrap(await api.commands.execute(sessionId, '/permission read-only'), 'commands.execute');
+          if (!permissionCommandSucceeded(r, 'read-only')) {
+            const detail = String(r?.result?.text ?? '未知结果').slice(0, 200);
+            log(`⚠️ ${key} 的 read-only 权限钉未生效：${detail}；该会话可能有本地工具，请检查日志`);
+            ext.audit.append('permission.chat_pin_failed', { key, sessionId, preset: 'read-only', error: detail });
+          }
+        } catch (error) {
+          const detail = String(error?.message ?? error);
+          log(`⚠️ ${key} 的 read-only 权限钉抛错：${detail}；该会话可能有本地工具，请检查日志`);
+          ext.audit.append('permission.chat_pin_failed', { key, sessionId, preset: 'read-only', error: detail });
+        }
       }
       // reset/清空工作区期间创建完成：丢弃，防止旧会话复活
       if (epoch !== sessionEpoch || policy !== sessionPolicy(key) || !isSessionAllowedInCurrentMode(key)) {

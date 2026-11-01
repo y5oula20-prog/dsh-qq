@@ -119,5 +119,39 @@ console.log('## 4. bundle 声明与安全边界');
   ok(deniedAll, '非法/未知/空工具名一律拒绝（fail-closed）');
 }
 
+console.log('## 5. 提示词瘦身（qq-prompt-trim）：只注册空 section，靠 shadow 生效');
+{
+  const trimFile = path.join(BUNDLE_DIR, 'qq-prompt-trim.mjs');
+  ok(fs.existsSync(trimFile), 'qq-prompt-trim.mjs 存在');
+  const trimMod = await import(pathToFileURL(trimFile).href);
+  assert.equal(trimMod.name, 'qq-prompt-trim');
+  assert.deepEqual(trimMod.inject, ['systemPrompt']);
+
+  const sections = [];
+  trimMod.apply({
+    effect: (fn) => { fn(); return () => {}; },
+    systemPrompt: { section: (s) => sections.push(s) },
+  });
+  const names = sections.map((s) => s.name);
+  for (const expected of ['harness:identity', 'dsh-ops:repository-tooling:shell', 'dsh-ops:repository-tooling:file',
+    'dsh-ops:repository-tooling:ptc', 'dsh-ops:discovery-tools', 'free-search:engines']) {
+    ok(names.includes(expected), `shadow 掉 ${expected}`);
+  }
+  // 这条是机制前提：renderPrompt() 会 filter 掉空串，所以 shadow 必须**留空**。
+  // 一旦有人在这里写了「温柔一点的替代文案」，就不是删段而是加段了。
+  ok(sections.every((s) => s.text === ''), '所有 shadow section 的 text 都是空串（renderPrompt 会丢弃）');
+  ok(sections.every((s) => Number.isFinite(s.order)), 'order 是有限数（否则 section() 抛 TypeError）');
+  ok(new Set(names).size === names.length, '没有重复注册同一个 section 名（同层重复会抛错）');
+
+  // config.sections 只能追加，不能替换默认表（防止误配把该压的段落放回来）。
+  const extra = [];
+  trimMod.apply({ effect: (fn) => { fn(); return () => {}; }, systemPrompt: { section: (s) => extra.push(s) } }, { sections: ['custom:thing'] });
+  ok(extra.some((s) => s.name === 'harness:identity') && extra.some((s) => s.name === 'custom:thing'),
+    'config.sections 在默认表之上追加');
+  const none = [];
+  trimMod.apply({ effect: (fn) => { fn(); return () => {}; }, systemPrompt: { section: (s) => none.push(s) } }, { enabled: false });
+  ok(none.length === 0, 'enabled:false 时一个 section 都不注册（便于排障时临时关掉）');
+}
+
 console.log(failures === 0 ? '\n✅ agent preset patch 契约通过' : `\n❌ ${failures} 项失败`);
 process.exit(failures === 0 ? 0 : 1);

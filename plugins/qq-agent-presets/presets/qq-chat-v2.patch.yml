@@ -49,6 +49,9 @@
           - id: qq-tool-restrict
             name: qq-agent-presets/qq-tool-restrict.mjs
             config: {}
+          - id: qq-prompt-trim
+            name: qq-agent-presets/qq-prompt-trim.mjs
+            config: {}
           - id: compaction
             name: cordis:group
             group: true

@@ -178,6 +178,13 @@ const USELESS_IN_QQ_TOOLS = [
   // 执行期白名单本来就拒（SAFE_PREFIXES 里没有它），这里补 restrict 是为了别占 schema。
   'mcp__bailian__bailian_chat', 'mcp__bailian__bailian_embed',
   'mcp__bailian__bailian_models', 'mcp__bailian__bailian_vision',
+  // 2026-11-01 L2：dsh-univer-office。原先靠 SAFE_PREFIXES 的 'univer_' 整族放行，
+  // 但那等于把写盘能力交给仿真会话（output 参数是磁盘路径），而真实会话里从没用过。
+  // 名字逐个取自 ~/.dsh/profiles/desktop/node_modules/dsh-univer-office/lib 的注册点。
+  'univer_api', 'univer_compile_svg', 'univer_execute', 'univer_export',
+  'univer_import', 'univer_inspect', 'univer_lint', 'univer_new',
+  'univer_print_pdf', 'univer_resources', 'univer_screenshot', 'univer_status',
+  'univer_unit', 'univer_worktree',
 ]
 
 const KNOWN_DANGEROUS_GLOBAL_TOOLS = [
@@ -219,13 +226,13 @@ export const SAFE_PREFIXES = [
   'mcp__snowluma__',
   'mcp__snowluma-host__',
   'mcp__web-search-safe__',
-  // 2026-10-28：鲸鱼娘要用得上这两个能力的插件工具面（owner 明示保留）。
-  //   univer_*     —— 在 QQ 里建/改 Office 文档、导出 PDF（dsh-univer-office）
-  //   whale_dive_* —— 读 B 站视频/字幕/弹幕/评论、抖音热门（dsh-whale-dive）
-  // ⚠️ 放行 univer_* 等于给仿真会话「写文件」能力：univer_new/univer_import/
-  //    univer_export/univer_screenshot 的 output 参数是磁盘路径。owner 已知情并选择放行；
-  //    若日后要收紧，改的是这里（把前缀删掉）而不是去动插件。
-  'univer_',
+  // 2026-10-28：读 B 站/抖音的插件工具面（owner 明示保留）。
+  //   whale_dive_* —— 读 B 站视频/字幕/弹幕/评论、抖音热门（dsh-whale-dive），纯只读、不落盘。
+  // 2026-11-01 L2：`univer_` 前缀已移除。它原本是 owner 知情下放行的，理由「在 QQ 里
+  //   建/改 Office 文档」，但放行它等于给仿真会话完整的写盘能力（univer_new/univer_import/
+  //   univer_export/univer_screenshot 的 output 都是磁盘路径），而配额会话里 899 次工具
+  //   调用中 univer_* 一次都没用过。现在它走 KNOWN_DANGEROUS_GLOBAL_TOOLS 被 restrict 隐藏。
+  //   要恢复：把 'univer_' 加回这里，并把下面 univer 那 15 个名字从名单里去掉。
   'whale_dive_',
 ]
 
