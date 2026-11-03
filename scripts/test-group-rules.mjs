@@ -87,7 +87,7 @@ test('接线：默认关闭、端点与 MCP 都要求显式 true、规则注入�
   assert.ok(seg.includes('agentTokenOk(key, agentToken)'), '令牌只和发起方会话比对');
   assert.ok(!seg.includes('noteModelMessagesV2'), '查看不标记目标群已读');
   assert.ok(!/sendGroupMessage|sendToQQ\(|scheduleWakeV2/.test(seg), '端点不发消息、不唤醒目标群');
-  const clear = bridge.slice(bridge.indexOf("url.pathname === '/api/socialV2/memory-clear'"), bridge.indexOf("url.pathname === '/api/socialV2/slang/query'"));
+  const clear = bridge.slice(bridge.indexOf("url.pathname === '/api/socialV2/memory-clear'"), bridge.indexOf("url.pathname === '/api/socialV2/growth-note'"));
   assert.ok(!clear.includes('ownerRules'), '群会话的 qq_memory_clear 不会清掉管理员规则');
 });
 

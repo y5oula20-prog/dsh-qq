@@ -13,7 +13,6 @@ import * as sensitive from '../src/sensitive.js';
 import * as wait from '../src/v2-wait.js';
 import * as safeFetch from '../src/safe-fetch.js';
 import * as forward from '../src/forward.js';
-import * as slang from '../src/slang-learner.js';
 import * as sticker from '../src/sticker-lib.js';
 import * as stickerLimits from '../src/lib/sticker-limits.mjs';
 import * as modelPrices from '../src/model-prices.js';
@@ -33,8 +32,6 @@ import * as presetPrompt from '../src/preset-prompt.js';
 import * as outboundGuard from '../src/outbound-guard.js';
 import * as stateAcl from '../src/state-acl.mjs';
 import * as bridgeExt from '../src/bridge-extensions.js';
-import * as groupMemory from '../src/group-memory.js';
-import * as memoryLib from '../src/memory/index.js';
 import * as growth from '../src/growth.js';
 import * as tts from '../src/tts.js';
 import * as draw from '../src/draw.js';
@@ -57,13 +54,10 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
   fs.writeFileSync(path.join(temp, 'config.json'), JSON.stringify({
     dsh: { authToken: 'fixture-only' }, ownerQQ: 123,
     allow: { private: ['123'], groups: ['456'] }, consolePort: 0,
-    consoleToken: 'fixture-console-token', slang: { enabled: false },
+    consoleToken: 'fixture-console-token',
     // 日记兜底任务（ensureDiaryReminderTask）是生产行为，会抢占 scheduler task #1 并启动定时器；
     // 单元测试不关心它，默认关掉，避免干扰 /remind 等断言里的任务 id 计数。
     socialV2: { diary: { enabled: false } },
-    // 逐条记忆库的旧记忆迁移默认指向不存在的文件：VM 里 process.env 是空桩，
-    // 不钉住的话会去读**真实的** ~/.dsh/qq-bridge/memory.md，测试就被本机数据影响了。
-    memory: { legacyFile: path.join(temp, 'no-legacy-memory.md') },
     ...config,
   }));
   if (savedState) fs.writeFileSync(path.join(temp, 'state/sessions.json'), JSON.stringify(savedState));
@@ -162,7 +156,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
   source = source.slice(0, source.indexOf("process.on('SIGINT'"));
   source = source.replace('  bot.onPrivateMessage(async (event) => {', `
   return {
-    ensureSession, ensureSlangLearnerSession, resolvePresetName, deliverPrompt, drainPromptQueue,
+    ensureSession, resolvePresetName, deliverPrompt, drainPromptQueue,
     sendToQQ, sendStickerV2, collectStickerV2, handleIncoming, startConsoleServer, cfg, state, api, promptQueues,
     getSocialV2State, appendSocialV2Message, recordSentMessagesV2,
     buildWakePromptV2, buildWakeSnapshotV2, sendWakePromptV2, socialV2,
@@ -194,10 +188,6 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     setReady(value) { dshReady = value; },
     setPresets(value) { dshPresetIds = value; dshDefaultPreset = 'standard'; },
     resetEpoch() { sessionEpoch++; },
-    // 10-29 逐条记忆库：注入与迁移都要能在 VM 外断言。
-    // memoryService 是 main() 里创建的实例（cfg.memory.dbFile 决定落盘位置）；
-    // recallBlockFor / migrateLegacyMemoryOnce 供注入路径与旧记忆迁移的端到端测试。
-    memoryService, recallBlockFor, migrateLegacyMemoryOnce, runMemoryDistill,
   };
   bot.onPrivateMessage(async (event) => {`);
   const timers = new Set();
@@ -215,22 +205,14 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     NodeApiClient: class { constructor() { return api; } },
     SnowLumaWebSocketClient: FakeBot, text: (s) => s,
     discoverDshLaunchToken: () => '', unwrap, createTurnCollector,
-    ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...slang, ...sticker, ...stickerLimits,
+    ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...sticker, ...stickerLimits,
     ...modelPrices, ...dshModel, ...quoteForward, ...modeHandover, ...roleCard, ...tokenLedger,
     createScheduler, parseRemindCommand, REMIND_HELP, formatTaskList, createScheduledNoteStore, scheduledPromptBlock, scheduledDirectPrompt, describeInstant, createSilenceSchedule, peakPresetRanges, describeRange, ...roleRefreshLib, ...voiceLib, ...stateAcl, ...presetPrompt, ...bridgeExt, ...outboundGuard,
     // 10-28~10-29 新增模块（语音/画画/唱歌/换声/黑话外挂/群记忆/成长笔记/连接发现）。
     // 曾经漏注入，导致 test-audit-bridge / test-role-refresh 在 VM 里跑出
-    // `ReferenceError: readTextSafe is not defined` / `readGrowthText is not defined`。
+    // `ReferenceError: readGrowthText is not defined`。
     ...tts, ...draw, ...artTags, ...asr, ...song, ...rvc, ...snowlumaConn,
-    // 顺序要紧：group-memory.js 与 growth.js 都导出 readTextSafe。
-    // bridge.js 里裸名 readTextSafe 指的是 group-memory 那个，growth 那个在 import 时被
-    // `readTextSafe as readGrowthText` 改名。所以这里先 spread growth、再 spread groupMemory
-    // 让裸名落在 group-memory 上，并显式补一个改名后的 readGrowthText ——
-    // spread 只带出模块原本的导出名，不会自动重建 import 时的别名。
-    ...growth, ...groupMemory,
-    // 10-29 逐条记忆库（记忆库门面 + 沉淀解析 + 旧记忆迁移解析）。
-    // 曾经漏注入，导致 test-voice 等测试在 VM 里跑出 `defaultDbFile is not defined`。
-    ...memoryLib,
+    ...growth,
     readGrowthText: growth.readTextSafe,
     // 断线补收（backfill）与日记（diary）——bridge.js 在 :24 / :132 import 它们，
     // harness 之前漏注入 backfill，导致 test-scheduler 在 VM 里跑出 `BACKFILL_DEFAULTS is not defined`。

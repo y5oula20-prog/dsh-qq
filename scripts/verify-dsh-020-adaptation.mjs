@@ -255,7 +255,7 @@ for (const f of ['src/mcp-snowluma-safe.js', 'src/mcp-host-server.js', 'src/mcp-
 // 注意 spawnSync 在受限环境（DSH 沙箱的 workspace-write）会以 EPERM 失败——
 // 那是**环境**不允许起子进程，不是文件有语法错。这种情况显式记为跳过，
 // 否则会输出一串假失败，把真正的失败淹掉（实测踩过）。
-const SYNTAX_FILES = ['src/bridge.js', 'src/dsh-client.js', 'src/mcp-snowluma-safe.js', 'src/mcp-host-server.js', 'src/mcp-web-search-safe.js', 'src/slang-learner.js', 'src/self-test.js', 'scripts/setup-dsh.mjs'];
+const SYNTAX_FILES = ['src/bridge.js', 'src/dsh-client.js', 'src/mcp-snowluma-safe.js', 'src/mcp-host-server.js', 'src/mcp-web-search-safe.js', 'src/self-test.js', 'scripts/setup-dsh.mjs'];
 {
   const probe = spawnSync(process.execPath, ['--check', path.join(ROOT, 'src/dsh-client.js')], { encoding: 'utf8' });
   if (probe.error?.code === 'EPERM') {

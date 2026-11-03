@@ -227,6 +227,16 @@ export const SAFE_PREFIXES = [
   'mcp__snowluma__',
   'mcp__snowluma-host__',
   'mcp__web-search-safe__',
+  // 2026-11-02：长期记忆移交 DSH 侧 dsh-memu-memory 插件（memu_private_* / memu_lexicon_* /
+  // memu_global_* / memu_status，13 个全局工具）。记忆的读写边界由插件的会话↔库绑定与
+  // effectiveScope 执行，工具本身不落本地盘、不执行命令。
+  // 2026-11-01 L2 的收窄口径继续有效：只放行**本会话**记忆面（memu_private_ 与 memu_lexicon_）。
+  // 跨会话的 memu_global_* 仍在 KNOWN_DANGEROUS_GLOBAL_TOOLS 里被 restrict 掉 ——
+  // 它们能读宿主的全局记忆库，QQ 侧不该串到桌面内容；执行期白名单也不会放行它们。
+  'memu_private_',
+  // memu_lexicon_* —— 词典是桥删掉黑话学习之后唯一还活着的那部分（术语/群梗的查询与提交），
+  // 同样是本会话范围：memu_lexicon_propose 只往当前库的候选里写，不跨会话。
+  'memu_lexicon_',
   // 2026-10-28：读 B 站/抖音的插件工具面（owner 明示保留）。
   //   whale_dive_* —— 读 B 站视频/字幕/弹幕/评论、抖音热门（dsh-whale-dive），纯只读、不落盘。
   // 2026-11-01 L2：`univer_` 前缀已移除。它原本是 owner 知情下放行的，理由「在 QQ 里
@@ -235,10 +245,6 @@ export const SAFE_PREFIXES = [
   //   调用中 univer_* 一次都没用过。现在它走 KNOWN_DANGEROUS_GLOBAL_TOOLS 被 restrict 隐藏。
   //   要恢复：把 'univer_' 加回这里，并把下面 univer 那 15 个名字从名单里去掉。
   'whale_dive_',
-  // 2026-11-01：memu 的**本会话**记忆面（list/recall/remember/update/archive/link/unpin）。
-  // 它们只读写绑定在本会话上的记忆库，不跨会话；跨会话的 memu_global_* 仍在
-  // KNOWN_DANGEROUS_GLOBAL_TOOLS 里被 restrict 掉，执行期白名单也不会放行它们。
-  'memu_private_',
 ]
 
 // 无害模型侧工具：ask_user_question 用于把问题转给管理员/用户，

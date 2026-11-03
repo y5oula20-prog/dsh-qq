@@ -63,6 +63,14 @@
    - 创建本地 `state/mode.json`（`mode: reserved2`）作为 DSH settings 不可用时的兜底
    - 尝试自动执行 `dsh plugin --profile web install`（当 `dsh` CLI 在 PATH 中可用时），注册两个插件的 bundle 依赖；若 `dsh` 不在 PATH，缺失依赖时 DSH 会提示补跑
 
+   **长期记忆插件（v1.2.0 起，需手动装一次）**：QQ 会话的长期记忆（事实/约定/偏好/黑话词典）由 DSH 侧的
+   [`dsh-memu-memory`](https://www.npmjs.com/package/dsh-memu-memory) 插件接管，桥本身不再带记忆引擎。
+
+   1. 在 DSH 里安装插件并重启 DSH：`npm i -g dsh-memu-memory` 后按其 README 挂到 profile（或在 DSH 设置里装）；数据落在 `~/.dsh/dsh-memu-memory/`。
+   2. 桥已为每个 QQ 会话建独立工作区（`state/agents/<group-群号 | private-QQ号>`），插件按工作区文件夹自动绑定各自的记忆库 —— 私聊记忆不会进群会话。首次写入时插件自动建库，也可以在它的 WebUI（DSH 设置 → MemU）里手动绑定/调整。
+   3. preset 的工具白名单已放行 `memu_*`（`plugins/qq-agent-presets/qq-tool-restrict.mjs` 的 `SAFE_PREFIXES`），模型侧即可用 `memu_private_remember` / `memu_private_recall` / `memu_lexicon_search` / `memu_lexicon_propose` / `memu_global_recall` 等 13 个工具；不用装插件时这些工具不存在，白名单放行不构成风险。
+   4. 旧版桥自带的记忆（`state/memory.sqlite3`、`state/group-memory-*.md`、`state/slang.json`）不再被读取；文件保留在原地可随时人工比对，可按插件文档用它的导入功能迁入。
+
    > 脚本可重复运行（幂等）：它会重建 `qq-agent-presets` 的 preset patch、更新 MCP 路径并重建失效的插件链接。
    > MCP 条目通过 YAML 解析后**按顶层 `insert` 内的条目 id 增删**（不依赖标记注释），支持带引号的 id、共享 `insert` 与行内 YAML，并保留其他插件配置和嵌套数据。
    > 脚本在写入前验证 YAML；无法解析时停止，不覆盖配置或 preset。只修复历史版本在文件开头遗留的多余 `[]`，不会删除正文中的空数组或文本。

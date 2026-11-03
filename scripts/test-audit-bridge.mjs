@@ -19,11 +19,10 @@ await test('closed-agent session is not reused after switching to chat', async (
   assert.equal(h.calls.created.at(-1).agentPreset, 'qq-chat');
   assert.ok(h.calls.cancelled.includes(privileged));
 });
-await test('unavailable preset catalogue fails closed for QQ and learner sessions', async (h) => {
+await test('unavailable preset catalogue fails closed for QQ sessions', async (h) => {
   h.setPresets([]);
   assert.equal(h.resolvePresetName('missing', { strict: true }), '');
   await assert.rejects(h.ensureSession('group:456'));
-  await assert.rejects(h.ensureSlangLearnerSession());
   assert.equal(h.calls.created.length, 0);
 });
 await test('session creation crossing a mode change never accepts stale permissions', async (h) => {

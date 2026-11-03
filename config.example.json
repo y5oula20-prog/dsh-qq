@@ -123,20 +123,6 @@
       }
     ]
   },
-  "slang": {
-    "enabled": true,
-    "extractMinMessages": 10,
-    "extractCooldownMs": 300000,
-    "inferenceThresholds": [
-      2,
-      4,
-      8
-    ],
-    "injectMax": 8,
-    "learnerPreset": "qq-chat",
-    "workspaceTitle": "QQ 黑话学习",
-    "autoResearch": true
-  },
   "social": {
     "enabled": true,
     "maxReplyChars": 500,
@@ -197,8 +183,6 @@
       "setWakeConfig": true,
       "markRead": true,
       "memory": true,
-      "slangQuery": true,
-      "slangSubmit": true,
       "getImages": true,
       "getForwardMsg": true,
       "sendPoke": true,

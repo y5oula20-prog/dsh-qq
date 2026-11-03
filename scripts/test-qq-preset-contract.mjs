@@ -92,10 +92,9 @@ test('autonomy limits and the observation escape hatch stay described', () => {
     '除非对方明确“不聊了/晚安/下了/拜拜”等结束语',
     // [SILENT] 是桥接的退出标记，误用会静默吞掉回复。
     '不要用 [SILENT]',
-    // 记忆面
+    // 记忆面（轻量记忆 = socialV2 会话工作记忆；长期记忆/词典 = MemU 插件）
     '【记忆卫生】', 'qq_memory_append', 'qq_memory_query', 'qq_memory_remove', 'qq_memory_clear',
-    // 黑话面
-    'qq_slang_query', 'qq_slang_submit', '不重复提交',
+    'memu_private_remember', 'memu_private_recall', 'memu_lexicon_search', 'memu_lexicon_propose', '不重复提交',
     // 频率上限
     '普通闲聊约 3~5 轮一张', '别刷屏', '每条只能一张，但 text 参数可以带一句短话', '不要频繁拍',
     // 会话令牌是硬前置，漏传会被拒绝。

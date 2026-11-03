@@ -15,7 +15,7 @@ const tests = [
   // 且只留下一行日志 —— 必须有登记期断言钉住（活 DSH 侧的实测见
   // scripts/test-dsh-session-retire.mjs）。
   'test-dsh-inbox-projection.mjs',
-  'test-md-to-plain.mjs', 'test-slang-learn.mjs', 'test-mux-reconnect.mjs',
+  'test-md-to-plain.mjs', 'test-mux-reconnect.mjs',
   // 回合收集器：follow 流打开前发出的 prompt 会让 turn/start 落进空档，collector 建不出
   // 槽位 ⇒ assistant/message 无处累加、turn/end 返回 null ⇒ 整轮回复被静默丢弃。
   // step/start 兜底建槽 + 已结束回合不复活，是「不丢回复也不重复发」的两条边界。
@@ -98,7 +98,6 @@ const tests = [
   'test-sticker-limits.mjs',
   // 管理员私聊跨群只读 + 群长期规则（默认关闭）：只有 owner 私聊能用、只读不改已读、规则由桥接写入并注入目标群唤醒。
   'test-group-rules.mjs',
-  'test-slang-tabs.mjs',
   // NapCat 管理：版本显示（后端自报 / Windows 安装文件）、检查更新（只提示）、目录与启动文件设置、系统「浏览…」窗口（Mac / Windows）。
   'test-napcat-manage.mjs',
   // 桥接日志按实际 QQ 后端称呼（经接口平台 · NapCat），不再一律写 SnowLuma。
@@ -109,9 +108,8 @@ const tests = [
   'test-dsh-health.mjs',
   // Linux 支持（增量，Windows / macOS 行为不变）：SnowLuma 2.x 发行包识别与启动、Node 要求、按平台的更新建议、Linux「浏览…」、NapCat 在 Linux、systemd 用户服务。
   'test-linux-support.mjs',
-  // Windows 实机部署反馈的问题：Release ZIP 中文文件名 UTF-8 标志、黑话研究日志计数、会话重置清等待租约、Linux 服务文件 POSIX 路径、禁止 URL.pathname 当路径。
+  // Windows 实机部署反馈的问题：Release ZIP 中文文件名 UTF-8 标志、会话重置清等待租约、Linux 服务文件 POSIX 路径、禁止 URL.pathname 当路径。
   'test-deploy-fixes.mjs',
-  'test-slang-guess.mjs',
   'test-dsh-model.mjs',
   'test-quote-forward.mjs',
   'test-mode-handover.mjs',
@@ -126,8 +124,6 @@ const tests = [
   'test-forward.mjs',
   // 表情包体系：sticker-lib 纯函数、配置项、MCP 工具描述存在性、单气泡约束。
   'test-stickers.mjs',
-  // 会话记忆（分群长期记忆）：分节解析/渲染、trim、沉淀输出拆分、注入预算 45/45/20、旧格式兼容。
-  'test-group-memory.mjs',
   // 二代「话说一半就等等」判定：looksLikeUnfinished 与已说完的句子不能混淆。
   'test-v2-wait.mjs',
   // setup-dsh.mjs 幂等：连跑两次不得产生重复 MCP 条目 id（DSH 遇重复 loader entry id 会启动崩溃）。

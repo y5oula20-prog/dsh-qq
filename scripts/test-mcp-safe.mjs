@@ -52,8 +52,6 @@ try {
   const schemaText = JSON.stringify(sendTool?.inputSchema ?? {});
   console.log('✅ replyToMessageId 参数:', schemaText.includes('replyToMessageId') ? '存在 ✓' : '缺失 ✗');
   console.log('✅ qq_reply 工具:', tools2.tools.some((t) => t.name === 'qq_reply') ? '存在 ✓' : '缺失 ✗');
-  console.log('✅ qq_slang_query 工具:', tools2.tools.some((t) => t.name === 'qq_slang_query') ? '存在 ✓' : '缺失 ✗');
-  console.log('✅ qq_slang_submit 工具:', tools2.tools.some((t) => t.name === 'qq_slang_submit') ? '存在 ✓' : '缺失 ✗');
 
   // 白名单内但 replyToMessageId 非法：应在发送前被参数校验拒绝（不会真实发消息）
   const invalidReply = await client.callTool({

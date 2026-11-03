@@ -1,6 +1,5 @@
 // Windows 实机部署（v1.0.1）反馈的问题的回归测试。全部离线、假数据。
 //   ① Release ZIP 的中文文件名必须带 UTF-8 标志（否则 Windows 解压乱码 / 失败），可执行脚本保留 0755；
-//   ② 黑话研究日志：「写入 / 解析 / 未确认」分开计数，未确认时把 AI 推测打进日志（仍然不写库）；
 //   ③ 会话重置要清掉 qq_wait_for_messages 的等待租约（三个重置入口都要），归一后的 key 也要清；
 //   ④ 生成 Linux 服务文件时路径一律用 POSIX 写法（Windows 上跑也不能变成反斜杠）；
 //   ⑤ 测试与脚本里不能用 URL.pathname 当文件路径（Windows 上是 /C:/…），要用 fileURLToPath。
@@ -38,21 +37,6 @@ test('① ZIP：中文文件名带 UTF-8 标志、内容与 CRC 正确、可执�
   assert.match(build, /createZip\(entries\)/);
   assert.ok(!/spawnSync\((?:winTar|'zip')/.test(build), '不再调用系统的 zip / tar.exe');
   assert.match(build, /\\\.\(command\|sh\)\$/, '.command / .sh 固定记成可执行');
-});
-
-test('② 黑话研究日志：写入数与未确认数分开统计；未确认附 AI 推测但不写库', () => {
-  const src = read('src/bridge.js');
-  const start = src.indexOf('const results = parseResearchJson(output);');
-  assert.ok(start > 0);
-  const fn = src.slice(start, src.indexOf('invalidateSlangLearnerSession();', start));
-  assert.match(fn, /let written = 0;/);
-  assert.match(fn, /let unconfirmed = 0;/);
-  assert.match(fn, /黑话研究：写入 \$\{written\} 条候选解释（解析 \$\{results\.length\} 条，未确认 \$\{unconfirmed\} 条）/);
-  assert.ok(!fn.includes('已更新 ${results.length} 条候选解释'), '不再用解析条数冒充写入条数');
-  const skip = fn.slice(fn.indexOf('if (r.confirmed !== true)'), fn.indexOf('if (r.meaning) entry.meaning'));
-  assert.match(skip, /AI 推测/);
-  assert.match(skip, /continue;/, '未确认的仍然跳过、不写库');
-  assert.ok(!/entry\.(meaning|usage|example)\s*=/.test(skip), '未确认分支里不改词条');
 });
 
 test('③ 会话重置清掉等待租约：forgetConversationCaches 连归一后的 key 一起清；三个重置入口都调用它', () => {

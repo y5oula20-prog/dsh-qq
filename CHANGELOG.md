@@ -3,6 +3,27 @@
 本仓库（qq-bridge-enhanced）基于上游 [Derpyu520/qq-bridge](https://github.com/Derpyu520/qq-bridge) `v0.2.0-r3`。
 上游更早的版本历史见 [docs/guides/DSH_020_ADAPTATION.md](docs/guides/DSH_020_ADAPTATION.md) 与上游 Release 页面。
 
+## v1.2.0 —— 2026-11-02
+
+架构调整版本：**长期记忆整体移交 DSH 侧 [dsh-memu-memory](https://www.npmjs.com/package/dsh-memu-memory) 插件**，桥不再自带记忆引擎；桥保留「认人」（人物库/跨群身份）与二代会话工作记忆。
+
+### 记忆移交（长期记忆 / 群沉淀 / 黑话 → MemU 插件）
+- **删除**：`src/memory/`（SQLite 逐条记忆）、`src/group-memory.js`（群沉淀 md）、`src/slang-learner.js`（黑话自动学习），以及桥内全部接线——记忆整理会话、群记忆注入（`groupMemoryBlockFor`）、召回注入（`recallBlockFor`）、黑话提取/研究流水线、`/api/slang*` 管理端点、控制台「黑话词库」页、MCP 工具 `qq_slang_query` / `qq_slang_submit`、QQ 命令 `/记忆` / `/记忆重置`（现只返回指引）。
+- **由插件接手**：锚点与逐轮召回注入、三层留存（short/long/must_remember）、矛盾挂起复核、黑话词典（含逐轮词典命中注入）、全局库、关系图，工具面 `memu_private_*` / `memu_lexicon_*` / `memu_global_*` / `memu_status` 共 13 个（preset 白名单已放行 `memu_` 前缀）。
+- **桥保留**：人物档案 `people.json`（`qq_get_person` / `qq_note_person`）、跨群身份（`cross-group.js`）、隐私路由（`memory-policy.js`——现在只服务人物注入的可见范围过滤）、入群/退群事件与群规则、角色成长笔记（`growth.js`）、二代会话工作记忆（activeTopics / pendingThoughts / memberImpressions，`qq_memory_*` 工具不受影响）。插件不记录「谁说的」「哪个群」，认人层必须留在桥里。
+- **会话工作区按会话分目录**（`state/agents/<key>`）：dsh-memu-memory 按 DSH 会话的工作区文件夹绑定记忆库，每个群/私聊各一个库，私聊记忆不会混进群会话（替代原 memory-policy 对记忆的作用域隔离）。已有会话要享受隔离需重置一次会话（`/api/session/reset` 或对应 QQ 命令）。
+- 旧数据文件（`state/memory.sqlite3`、`state/group-memory-*.md`、`state/slang.json`）不再读取，保留在原地；迁移方式见 `docs/guides/DSH_SETUP.md`。
+- 投递前注入瘦身为「时间线」一项（`withSlangContext` → `withPromptPreamble`）；`config.json` 的 `memory.*` / `slang.*` 段不再被读取，可删除。
+
+### 升级注意（从 v1.1.0）
+- **要装 dsh-memu-memory ≥ 1.2.4**（黑话词典 `memu_lexicon_*` 是 1.2.4 才有的能力），并重启一次 DSH：插件自带的 MCP 工具与注入层由 DSH 启动时加载，只重启桥接看不到。
+- **已有会话要重置一次**才能享受按会话隔离：v1.1.0 所有会话共用 `state/agents` 一个目录，v1.2.0 改成 `state/agents/<key>`；不重置的会话仍绑在旧目录的记忆库上。重置只清 DSH 侧的对话历史，`state/agents/<key>` 里的记忆库、`people.json`、群规则、表情、定时任务都不会丢。
+- preset 与工具白名单已改为 `memu_*`：**要重启 DSH 让新的 preset 层生效**，不需要重跑 `setup-dsh.mjs`。
+- 旧数据（`state/memory.sqlite3`、`state/group-memory-*.md`、`state/slang.json`）保留原地不删，可按 `docs/guides/DSH_SETUP.md` 用插件的导入功能迁入。
+
+### 测试
+- 删除 `test-group-memory` / `test-memory-store` / `test-bridge-memory` / `test-slang-learn` / `test-slang-tabs` / `test-slang-guess`；`test-hardening` 移除黑话段；`test-deploy-fixes` 移除黑话研究日志断言；preset 契约测试改为钉住 `memu_*` 工具描述；控制台 UI 测试移除黑话页流程。
+
 ## v1.1.0 —— 2026-10-22
 
 新功能版本：**定时任务**（按时区到点发消息或叫 AI 来说）、**定时静默**（按时间段让 AI 停下来省 token）；**切换 / 修改人格在二代仿真里真正生效**（以前要等会话重建）；切到 agent 时可以带上私聊长期记忆。

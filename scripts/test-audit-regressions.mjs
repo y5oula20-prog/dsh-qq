@@ -13,7 +13,6 @@
 //   R9  memory-update 不得凭空建条目、不得写穿原型链
 //   R10 wait 的租约按归一化 key 记账（group:0456 与 group:456 是同一个会话）
 //   R11 mdToPlain：`*` 列表/乘法不被当成斜体；超长畸形输入不再 O(n²)
-//   R12 黑话提取的候选扫描次数有上限（大量 `[` 不得卡住事件循环）
 //   R13 表情备注截断不切开代理对
 //   R14 token 账本：被淘汰采样被新基线覆盖后不得重复计费
 //   R15 /api/send/* 失败路径的 st/now 越界（与 R2 同型，残留在这条旧发送工具真正走的端点）
@@ -27,7 +26,6 @@ import os from 'node:os';
 import path from 'node:path';
 import { bridgeHarness } from './audit-bridge-harness.mjs';
 import { mdToPlain } from '../src/md-to-plain.js';
-import { extractJsonArray } from '../src/slang-learner.js';
 import { sanitizeStickerText } from '../src/sticker-lib.js';
 import { createTokenLedger } from '../src/token-ledger.js';
 import { DEFAULT_PRICE_TABLE } from '../src/model-prices.js';
@@ -331,15 +329,6 @@ await test('R11 mdToPlain 保留 * 列表与乘法式，且拒绝二次方退化
   mdToPlain(evil);
   const elapsed = Date.now() - t0;
   assert.ok(elapsed < 500, `畸形 Markdown 不得卡住事件循环（实际 ${elapsed}ms）`);
-});
-
-// ── R12. 黑话候选扫描次数有上限 ─────────────────────────────────────────────
-await test('R12 extractJsonArray 对大量 "[" 不退化（扫描次数有上限）', async () => {
-  const t0 = Date.now();
-  const out = extractJsonArray('['.repeat(100000));
-  const elapsed = Date.now() - t0;
-  assert.equal(out, null);
-  assert.ok(elapsed < 1000, `扫描必须有界（实际 ${elapsed}ms）`);
 });
 
 // ── R13. 表情文本截断不切开代理对 ──────────────────────────────────────────
