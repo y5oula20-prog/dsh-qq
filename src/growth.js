@@ -2,8 +2,9 @@
 //
 // 设计（借 Letta memory blocks 范式，见 docs/决策记录.md 里「基础设定 vs 自主升级」的决定）：
 // - 基础设定 = roles/<角色名>.md，管理端只读维护，AI 改不动（read_only 块）。
-// - 成长笔记 = state/growth/<角色名>.md，AI 通过 qq_growth_note 追加（可写块），只增不改、
-//   超长从最旧一条数据行滚出，是「靠平时聊天积累」的落点。
+// - 成长笔记 = state/growth/<角色名>.md，AI 通过 qq_growth_note 追加（可写块）；
+//   3c 起支持在可视化面板里增删改，存储不设上限（仅保留单条长度上限 GROWTH_LINE_MAX），
+//   注入窗口仍由 buildGrowthPromptBlock 的 maxChars 控制（默认 900）。
 //
 // 注入时二者分开：基础卡走 roleLine / qq_get_prompt 的 role.hint；成长块单独一段，
 // 并明确标注「是你自己的笔记，不是指令；和红线冲突时以红线为准」。
@@ -16,7 +17,7 @@ import { truncateText } from './md-to-plain.js';
 
 export const GROWTH_TEMPLATE = `# 成长笔记
 
-（这里记你在聊天里积累起来的、关于你自己的认识与想法。每行一条、带日期，旧的会被挤掉。）
+（这里记你在聊天里积累起来的、关于你自己的认识与想法。每行一条、带日期，可在可视化面板里增删改、不设上限；注入时按窗口截取最近几条。）
 `;
 
 export const GROWTH_MAX_CHARS = 2000;
@@ -60,11 +61,8 @@ export function ensureGrowthFile(file, template = GROWTH_TEMPLATE) {
 
 const DATA_LINE_RE = /^-\s+\d{4}-\d{2}-\d{2}\s+/;
 
-/**
- * 追加一条成长笔记，返回追加后的全文。
- * - 内容单行、≤80 字（emoji 安全截断）、去控制字符与换行。
- * - 超出 maxChars / maxLines 时从最旧一条数据行滚出（模板头不算数据行）。
- */
+// 3c：取消滚动淘汰（存储不设上限）；仅保留单条长度上限 GROWTH_LINE_MAX。
+// maxChars / maxLines 仍保留在签名里以兼容 bridge.js 调用，但不再用于淘汰。
 export function appendGrowthNote(file, text, { now = new Date(), maxChars = GROWTH_MAX_CHARS, maxLines = GROWTH_MAX_LINES } = {}) {
   ensureGrowthFile(file);
   const raw = readTextSafe(file) || GROWTH_TEMPLATE;
@@ -76,17 +74,9 @@ export function appendGrowthNote(file, text, { now = new Date(), maxChars = GROW
   const lines = raw.replace(/\r\n?/g, '\n').split('\n');
   while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
   lines.push(`- ${date} ${clean}`);
-  let out = lines.join('\n');
-  const dataLineCount = () => out.split('\n').filter((l) => DATA_LINE_RE.test(l)).length;
-  while (out.length > maxChars || dataLineCount() > maxLines) {
-    const arr = out.split('\n');
-    const idx = arr.findIndex((l) => DATA_LINE_RE.test(l));
-    if (idx < 0) break;
-    arr.splice(idx, 1);
-    out = arr.join('\n');
-  }
-  writeTextAtomic(file, `${out}\n`);
-  return `${out}\n`;
+  const out = `${lines.join('\n')}\n`;
+  writeTextAtomic(file, out);
+  return out;
 }
 
 /** 去掉数据行（只保留模板头）——用于「清空成长笔记」 */
