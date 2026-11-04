@@ -23,6 +23,7 @@ import { alreadyIngested, findRepeatedMessages, findStickerIdLeaks, repeatWarnin
 import { looksLikeUnfinished } from './v2-wait.js';
 import { compactModelMessage } from './qq-model-view.js';
 import { BACKFILL_DEFAULTS, normalizeBackfillConfig, createUpstreamGapTracker, createSeenMessageIds, selectBackfill, describeDuration, backfillNoticeBlock } from './backfill.js';
+import { startTaskBroadcast } from './task-broadcast.js';
 import { safeFetch, safeFetchBuffer, looksLikeImageBuffer } from './safe-fetch.js';
 import { stickerMaxBytes } from './lib/sticker-limits.mjs';
 import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, inspectAudio, listAudioFiles, parseTargetKey, processAudioVolume, resolveAudioProcessing, resolveAudioSource, safeJoinLibrary } from './send-voice-lib.js';
@@ -3499,6 +3500,17 @@ async function main() {
     applyMode: applyModeChange,
     onApprovalTimeout,
   });
+
+  // ── 任务播报（P1/P2，方案 §6.3）：DSH 工作动向 → 测试群状态卡；群内远程拍板路由 ──
+  // 只读：只挂钩子观察已有事件流；发卡片走管理通道语义（sendGroupDirect，绕过模式/白名单）。
+  const taskBroadcast = startTaskBroadcast({
+    cfg,
+    log,
+    notifyGroup: async (text) => {
+      for (const gid of taskBroadcast.groups()) await sendGroupDirect(gid, text);
+    },
+  });
+  let startupAnnounced = false;
   // ── 定时任务（逻辑在 src/scheduler/，这里只接线：校验目标、怎么发） ──────────────────
   const scheduledNotes = createScheduledNoteStore();
   const schedulerOwnerKey = () => `private:${String(cfg.ownerQQ ?? '')}`;
@@ -9449,6 +9461,24 @@ async function main() {
     return sendChain;
   }
 
+  /**
+   * 管理通道专用：直接发指定群（任务播报、群内确认回执）。
+   * 与 sendOwnerDirect 同一语义：不走 sendToQQ 的「模式 + 白名单」校验（播报/确认必须任何模式下都通），
+   * 目标由 cfg.taskBroadcast.groups / confirmGroups 配置控制，文本由桥接生成（不含模型输出），仍做令牌脱敏。
+   */
+  function sendGroupDirect(groupId, msg) {
+    const gid = String(groupId ?? '').trim();
+    if (!/^[1-9]\d{0,11}$/.test(gid) || !msg) return Promise.resolve();
+    const parts = splitForQQ(redactKnownTokensOnly(String(msg)));
+    for (const part of parts) {
+      sendChain = sendChain
+        .then(() => withTimeout(bot.sendGroupMessage(Number(gid), text(escapeCqText(part))), SEND_TIMEOUT_MS, `QQ发送 group:${gid}`))
+        .catch((error) => log(`管理通道发送失败 (group:${gid}):`, error?.message ?? error))
+        .then(() => sleep(cfg.sendDelayMs));
+    }
+    return sendChain;
+  }
+
   /** 上一批发往该会话的消息是否全部成功。 */
   function lastSendSucceeded(key) {
     return lastSendFailed.get(key) !== true;
@@ -13354,11 +13384,12 @@ async function main() {
     return d;
   }
 
-  async function tryHandleApprovalReply(key, text, isOwner) {
+  async function tryHandleApprovalReply(key, text, isOwner, replyFn = null) {
     if (!isOwner) return false;
     const r = ext.approvals.resolveReply(key, text);
     if (!r) return false;
-    const reply = (msg) => (ext.isOwnerPrivateKey(key) ? sendOwnerDirect(msg) : sendToQQ(key, msg));
+    // replyFn：群内远程确认（tryGroupConfirm）时把回执发回群里；默认发到审批所属会话。
+    const reply = replyFn ?? ((msg) => (ext.isOwnerPrivateKey(key) ? sendOwnerDirect(msg) : sendToQQ(key, msg)));
     if (!r.ok) {
       await reply(`⚠️ ${r.error}`);
       return true;
@@ -13383,6 +13414,35 @@ async function main() {
       await reply(`⚠️ 审批 #${entry.id} 回执提交失败，请再回复一次「${r.decision === 'allowed-once' ? '通过' : '拒绝'} #${entry.id}」。`);
     }
     return true;
+  }
+
+  /**
+   * 测试群远程确认（P2，方案 §6.3）：owner 在配置的确认群里回复「通过 #N / 拒绝 #N」，
+   * 或回答发起会话挂起的提问（方案级拍板：确认 / 改方案X / 停 都是自由文本，原样路由给 agent）。
+   * 安全边界与 owner 私聊一致：调用方已校验「发送者 = ownerQQ」的真实 QQ 消息；审批仍走编号登记表，
+   * 模型无法伪造；提问答案路由到发起会话的挂起条目，不会误伤其他会话。
+   * @returns {boolean} true = 消息已被消费，不再进入正常聊天流程
+   */
+  async function tryGroupConfirm(groupKey, text) {
+    if (!taskBroadcast.isConfirmGroup(String(groupKey).replace(/^group:/, ''))) return false;
+    for (const sourceKey of taskBroadcast.sourceKeys()) {
+      const r = ext.approvals.resolveReply(sourceKey, text);
+      if (r) {
+        appendActivity(`${groupKey} 远程确认审批（来源 ${sourceKey}）`);
+        await tryHandleApprovalReply(sourceKey, text, true, (msg) => sendGroupDirect(String(groupKey).replace(/^group:/, ''), msg));
+        return true;
+      }
+    }
+    for (const sourceKey of taskBroadcast.sourceKeys()) {
+      const p = pending.get(sourceKey);
+      if (p?.kind === 'question') {
+        await sendGroupDirect(String(groupKey).replace(/^group:/, ''), `↪️ 已把你的回复转给小柚（发起会话 ${sourceKey}），她处理完会在群里播报。`);
+        appendActivity(`${groupKey} 远程回答提问（来源 ${sourceKey}）`);
+        await handlePendingAnswer(p, text, sourceKey, true);
+        return true;
+      }
+    }
+    return false;
   }
 
   /** /say：owner 让机器人在白名单群原话发言。在二代记忆里标注「受管理员之托」，避免她把这句话当成自己的观点。 */
@@ -13433,6 +13493,18 @@ async function main() {
         }
       }
       if (currentLevel !== 'L0') ext.controller.touch();
+    }
+    // ── P2 测试群远程确认：owner 在确认群里回审批/提问答案，路由到播报来源会话 ──
+    // 与 owner 私聊拦截同一层（modeAllowed 之前）：人在外面、桥处于任何模式下都要能拍板。
+    // 只认「确认群 + 发送者 = ownerQQ」；普通群友消息与此无关，照常往下走。
+    if (!backfill && kind === 'group' && ext.adminEnabled()
+        && String(event.user_id) === String(cfg.ownerQQ ?? '')
+        && taskBroadcast.isConfirmGroup(String(id))) {
+      const confirmText = (await segmentsToText(event.message ?? [], { includeReply: false })).trim();
+      if (confirmText && await tryGroupConfirm(key, confirmText)) {
+        rememberAdminMessageId(event.message_id ?? event.msg_id);
+        return;
+      }
     }
     if (!modeAllowed(key, kind, id, cfg, currentMode)) {
       log(`忽略未授权会话 ${key}（当前模式 ${currentMode}，来自 ${event.user_id}）`);
@@ -14158,9 +14230,11 @@ async function main() {
               pendingSendToolCalls.delete(frame.sessionId);
               v2TurnStartAt.set(frame.sessionId, Date.now());
               turnLeaseNoted.delete(frame.sessionId);
+              taskBroadcast.onTurnStart(key, frame.sessionId);
             }
             if (frame.event.type === 'tool/call') {
               const toolName = String(frame.event.data?.name ?? '');
+              taskBroadcast.onToolCall(key, toolName);
               const callId = frame.event.data?.callId;
               const args = sanitizeToolArgs(frame.event.data?.arguments ?? frame.event.data?.input ?? frame.event.data);
               appendToolLog({ type: 'call', time: new Date().toISOString(), key, sessionId: frame.sessionId, tool: toolName, args });
@@ -14216,6 +14290,7 @@ async function main() {
             if (ended) {
               // v0.3.0：高权限 Agent 的回合结束算一次活动（闲置回落从这里重新计时）。
               if (currentLevel !== 'L0' && ext.isOwnerPrivateKey(key)) ext.controller.touch();
+              void taskBroadcast.onTurnEnd(key, { text: ended?.text, reasonKind: ended?.reason?.kind });
               // reserved2 无行动兜底：普通唤醒回合若既没发消息、也没 mark_read / set_wake_config，
               // 则累计 noActionCount；达到阈值后自动重置 WakeConfig，避免 AI 卡死。
               const silentQueueNow = social.silentTurns.get(frame.sessionId) ?? [];
@@ -14493,6 +14568,7 @@ async function main() {
             });
             await sendToQQ(key, '❓ agent 需要你回答：\n' + lines.join('\n') + '\n（直接回复选项文字或输入你的回答）');
             await registerPending(key, { kind: 'question', rpcId: envelope.rpcId, sessionId: frame.sessionId, clientId: frame.clientId, eventId: frame.eventId, questions: frame.questions });
+            void taskBroadcast.onAwaitingInput(key, 'question', lines.join('\n'));
           } else if (frame.type === 'approval/requested') {
             const key = reverse.get(frame.sessionId);
             if (!key) continue;
@@ -14509,6 +14585,7 @@ async function main() {
             const msgText = ext.renderApprovalRequest(entry, { key, auditKey, redactAll: (s) => (SENSITIVE_RE.test(String(s)) ? redactSensitiveText(s) : String(s)) });
             if (ext.isOwnerPrivateKey(key)) await sendOwnerDirect(msgText);
             else await sendToQQ(key, msgText);
+            void taskBroadcast.onAwaitingInput(key, 'approval', msgText);
           } else if (frame.type === 'stream/error') {
             log('事件流错误:', frame.error);
           }
@@ -14630,6 +14707,7 @@ async function main() {
 
   bot.on('open', () => {
     backendIsNapCat = null; // 网关可能换了（SnowLuma ⇄ NapCat），重新判断
+    if (!startupAnnounced) { startupAnnounced = true; void taskBroadcast.announceStartup(); }
     // 用实际连接地址（自愈后可能与 config 里的初值不同，别打印过期的那个）
     const connectedUrl = bot.url ?? cfg.snowluma.wsUrl;
     snowlumaHealth.connected = true;

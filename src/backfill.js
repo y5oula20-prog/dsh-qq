@@ -93,7 +93,7 @@ export function isCommandLike(text) {
   if (!t) return false;
   if (t.startsWith('/')) return true;
   if (/^\d{4,8}$/.test(t)) return true; // 确认码 / TOTP
-  if (/^#?\d{0,4}\s*(同意|批准|允许|拒绝|驳回|取消|确认|yes|no|y|n|ok)\s*[。.!！]?$/i.test(t)) return true;
+  if (/^#?\d{0,4}\s*(同意|批准|允许|拒绝|驳回|取消|确认|停止|停|改方案|yes|no|y|n|ok)\s*[。.!！]?$/i.test(t)) return true;
   return false;
 }
 

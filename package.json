@@ -13,6 +13,7 @@
     "test:audit": "node scripts/test-audit.mjs",
     "test:regressions": "node scripts/test-audit-regressions.mjs",
     "test:issues": "node scripts/test-issue-regressions.mjs",
+    "test:task-broadcast": "node scripts/test-task-broadcast.mjs",
     "test:media-search": "node scripts/test-media-search.mjs",
     "test:initial-prompt": "node scripts/test-v2-initial-prompt.mjs",
     "test:token": "node scripts/test-token-economy.mjs && node scripts/test-reply-wait.mjs && node scripts/test-qq-model-view.mjs && node scripts/test-qq-preset-contract.mjs && node scripts/test-outbound-guard.mjs",

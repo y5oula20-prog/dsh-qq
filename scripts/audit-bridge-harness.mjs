@@ -42,6 +42,7 @@ import * as rvc from '../src/rvc.js';
 import * as snowlumaConn from '../src/snowluma-conn.js';
 import * as backfill from '../src/backfill.js';
 import * as diary from '../src/diary.js';
+import * as taskBroadcast from '../src/task-broadcast.js';
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -217,6 +218,8 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     // 断线补收（backfill）与日记（diary）——bridge.js 在 :24 / :132 import 它们，
     // harness 之前漏注入 backfill，导致 test-scheduler 在 VM 里跑出 `BACKFILL_DEFAULTS is not defined`。
     ...backfill, ...diary,
+    // 任务播报（task-broadcast）——bridge.js import 它；setInterval 在上面已桩掉，心跳不会真跑。
+    ...taskBroadcast,
     // ACL 收紧会 spawn icacls 去改**真实**文件系统；测试不该做这件事（同理见下面的
     // cleanupTemp / processAudioVolume 桩）。桩成成功，让 hardenStateDirAcl 走正常分支。
     hardenDir: () => ({ ok: true, detail: 'stub' }),

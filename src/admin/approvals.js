@@ -13,7 +13,8 @@
 // 同一会话里）消费。模型没有任何能调用 decide() 的工具或接口 —— AI 说「已经批准了」没有任何效果。
 
 const APPROVE_RE = /^(通过|批准|同意|允许|approve|yes|y|ok)$/i;
-const REJECT_RE = /^(拒绝|否决|不同意|不允许|deny|reject|no|n)$/i;
+// 「停/停止」：任务播报（P2）群内远程拍板用的口语拒绝词，语义等同「拒绝」。
+const REJECT_RE = /^(拒绝|否决|不同意|不允许|停|停止|deny|reject|no|n)$/i;
 
 /**
  * 解析 owner 的审批回复。

@@ -38,6 +38,15 @@
   "ackMessage": "",
   "sendDelayMs": 300,
   "questionTimeoutMs": 300000,
+  "taskBroadcast": {
+    "enabled": true,
+    "groups": [],
+    "confirmGroups": [],
+    "sessions": ["owner"],
+    "heartbeatMinutes": 10,
+    "maxChars": 400,
+    "textChars": 220
+  },
   "consolePort": 3100,
   "consoleToken": "",
   "pricing": {
